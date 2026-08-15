@@ -1,0 +1,16 @@
+node_modules/
+.claude/
+.env
+service-account.json
+eaf-session.json
+lcc-session.json
+*.log
+run.lock
+gm-snapshot.json
+lcc-snapshot.json
+pending-alerts.json
+evidence/
+sheet-images/
+# Real business data exports (e.g. HOC-REPORTS-final (1).xlsx) — never track
+# spreadsheet exports/extracts alongside the code that generates them.
+*.xlsx
