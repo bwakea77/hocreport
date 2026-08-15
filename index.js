@@ -9,7 +9,7 @@ const { getSheetsClient } = require('./sheetsClient');
 const { runDailySnapshot } = require('./dailySnapshot');
 const { writeLccYesterdaySnapshot, writeLccTodaySnapshot } = require('./lccSnapshot');
 const { runHocReportsEntry, correctGmValues } = require('./hocReportsEntry');
-const { runEalReportsEntry, correctEalValues } = require('./ealReportsEntry');
+const { runEalReportsEntry, correctEalValues, correctEalDataEntryValues, appendEalDataEntryRows } = require('./ealReportsEntry');
 const { saveGmSnapshot, loadGmSnapshot, compareGm } = require('./gmSnapshotStore');
 const { saveLccSnapshot, loadLccSnapshot, compareLcc } = require('./lccSnapshotStore');
 const { queueAlert, queueSuccessIfClean, flushAlerts } = require('./alert');
@@ -25,7 +25,12 @@ const { uploadImageToSlack } = require('./slackFiles');
 // primary run later and delaying everyone who reads DAILY_SNAPSHOT right
 // after it. 16:25 exists because the LCC (Transport P&L) dashboard has its
 // own same-day "Today" view, worth reading again once most of the business
-// day's activity has posted, separate from the two EAF runs above.
+// day's activity has posted, separate from the two EAF runs above. As of
+// 2026-08-15, 16:25 also writes a same-day preliminary row into EAL Data
+// Entry (partial-day figures) — the next morning's 05:00 run always
+// overwrites that date's EAL Data Entry values with its finalized scrape
+// (see the correction call in runLccPrimary), so the preliminary figures
+// never linger past the following morning.
 const isEodRun = process.argv.includes('--eod');
 const isVerifyRun = process.argv.includes('--verify');
 const RUN_LABEL = isEodRun ? '1625' : isVerifyRun ? '0530' : '0500';
@@ -205,6 +210,15 @@ async function runLccPrimary(sheets, targetDate) {
     saveLccSnapshot(targetDate, { dateData, mtdData });
     log('LCC_SNAPSHOT (Yesterday + MTD) written.');
     await writeEalReportsEntry(sheets, targetDate, dateData, mtdData);
+    // Unconditional correction on top of the insert-if-missing write above —
+    // covers the common case where yesterday's 16:25 EOD run already
+    // inserted a same-day preliminary row for targetDate from a partial
+    // "Today" scrape, which the insert step just skipped as "already
+    // exists." This morning's finalized "Yesterday" scrape must win over
+    // that partial figure, so it's applied unconditionally rather than only
+    // when a diff is detected (no preliminary row means this just re-writes
+    // the values the insert above wrote a moment ago — harmless).
+    await correctEalDataEntryValues(sheets, targetDate, dateData);
     await alertOnLccGaps('Yesterday', dateData);
     await alertOnLccGaps('MTD', mtdData);
   } catch (err) {
@@ -374,10 +388,30 @@ async function captureAndPostDashboardImages(sheets, targets, targetDate) {
   }
 }
 
+// Best-effort, like writeEalReportsEntry above — a write hiccup here
+// surfaces as its own alert rather than aborting the LCC_SNAPSHOT write that
+// already succeeded. Only touches EAL Data Entry (not EAL GM & EBITDA
+// Entry): the EOD run only scrapes a single day ("Today"), not an MTD range,
+// so there's no MTD figure to write into the GM & EBITDA tab's row here.
+async function writeEalDataEntryPreliminary(sheets, today, data) {
+  try {
+    await withRetryOnce('ealReportsEntry: EAL Data Entry preliminary write', () =>
+      appendEalDataEntryRows(sheets, today, data)
+    );
+  } catch (err) {
+    const warning = `⚠️ [${RUN_LABEL}] EAL Data Entry preliminary write failed — ${err.message}.`;
+    log(warning);
+    queueAlert(`${warning} (${new Date().toISOString()})`);
+  }
+}
+
 // 16:25 — LCC-only EOD run. Reads the LCC dashboard's "Today" view (today's
 // activity so far, EAT calendar day) and writes it to LCC_SNAPSHOT's Today
-// block. Independent of the EAF/DAILY_SNAPSHOT pipeline entirely — no EAF
-// scrape, no HOC-REPORTS-final write.
+// block, plus a same-day preliminary row into EAL Data Entry from the same
+// partial-day figures (tomorrow's 05:00 run always overwrites that row with
+// its finalized scrape — see the correction call in runLccPrimary).
+// Otherwise independent of the EAF/DAILY_SNAPSHOT pipeline entirely — no EAF
+// scrape, no other HOC-REPORTS-final write.
 async function runEod() {
   const today = eatCalendarDate(0);
   log(`Run started (${RUN_LABEL}). Target date = ${today.toDateString()}`);
@@ -386,6 +420,7 @@ async function runEod() {
   const sheets = await getSheetsClient();
   await writeLccTodaySnapshot(sheets, today, data);
   log('LCC_SNAPSHOT (Today/EOD) written.');
+  await writeEalDataEntryPreliminary(sheets, today, data);
   await alertOnLccGaps('Today', data);
 
   await captureAndPostDashboardImages(sheets, config.sheetImages.targets.eod, today);
