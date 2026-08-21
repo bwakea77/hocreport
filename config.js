@@ -157,6 +157,19 @@ module.exports = {
     ealGmEbitdaEntryTab: 'EAL GM & EBITDA Entry',
   },
 
+  // Zoho Mail SMTP — mirrors the Slack alert channel (same events, same
+  // dashboard images) delivered to an inbox instead. Self-send: EMAIL_USER
+  // both authenticates and receives, unless EMAIL_TO is set separately.
+  email: {
+    smtpHost: process.env.EMAIL_SMTP_HOST || 'smtp.zoho.com',
+    smtpPort: process.env.EMAIL_SMTP_PORT ? parseInt(process.env.EMAIL_SMTP_PORT, 10) : 465,
+    smtpSecure: process.env.EMAIL_SMTP_SECURE ? process.env.EMAIL_SMTP_SECURE !== 'false' : true,
+    user: process.env.EMAIL_USER,
+    password: process.env.EMAIL_PASSWORD,
+    from: process.env.EMAIL_FROM || process.env.EMAIL_USER,
+    to: process.env.EMAIL_TO || process.env.EMAIL_USER,
+  },
+
   slack: {
     // Incoming Webhook URL — Slack app -> Incoming Webhooks -> Add New
     // Webhook to Workspace. Posts to whichever channel the webhook was

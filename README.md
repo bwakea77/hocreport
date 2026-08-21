@@ -133,6 +133,40 @@ internet, Google Sheets, and the EAF dashboard were all unaffected) —
 `hooks.slack.com` was checked against the same failure mode before this
 migration and is not blocked.
 
+### 5b. Email alerting (Zoho Mail SMTP, mirrors Slack)
+
+Every text alert this pipeline sends to Slack (gap/correction/failure/
+success) and every dashboard screenshot (see §6 below) is also emailed —
+same events, same content, a second independent channel in case Slack is
+down or just not where the recipient is looking. Self-send by default:
+`EMAIL_USER` both authenticates via SMTP and receives, unless `EMAIL_TO` is
+set to a different address.
+
+1. In the sending Zoho Mail account (`ebwakea@eafoods.com`), go to
+   **Zoho Mail → Settings → Security → App Passwords** and generate one for
+   this pipeline. Zoho's SMTP rejects the account's normal login password for
+   app-based auth — this must be an app password.
+2. Fill in `.env`:
+   ```
+   EMAIL_SMTP_HOST=smtp.zoho.com
+   EMAIL_SMTP_PORT=465
+   EMAIL_SMTP_SECURE=true
+   EMAIL_USER=ebwakea@eafoods.com
+   EMAIL_PASSWORD=<the app password from step 1>
+   EMAIL_TO=ebwakea@eafoods.com
+   ```
+3. Send a test message to confirm it works before relying on it:
+   ```
+   node -e "const e = require('./email'); e.queueEmailAlert('test'); e.flushEmailAlerts().then(() => console.log('sent'))"
+   ```
+   You should see it land in the inbox within a couple of seconds, and `sent`
+   printed once it's confirmed delivered.
+
+If `EMAIL_USER`/`EMAIL_PASSWORD`/`EMAIL_TO` aren't all set, `email.js`
+behaves like `alert.js` does when `SLACK_WEBHOOK_URL` is missing: it holds
+queued messages in `pending-emails.json` (gitignored, same retry-next-run
+shape as `pending-alerts.json`) instead of failing the run.
+
 ### 6. Dashboard screenshots (optional, but on by default)
 
 Every run also screenshots a few dashboard tabs (config.js's
@@ -262,6 +296,7 @@ here — see the README's setup steps for those.
 | `lccSnapshotStore.js` | Same idea as `gmSnapshotStore.js`, for the LCC dashboard's scraped figures (`lcc-snapshot.json`) |
 | `evidence.js` | Saves each run's full-page dashboard screenshot to `evidence/` |
 | `alert.js` | Slack (Incoming Webhook) success/gap/correction/failure notification |
+| `email.js` | Zoho Mail (SMTP, via `nodemailer`) success/gap/correction/failure notification + dashboard-image attachments — mirrors `alert.js`'s queue/retry/pending-file shape over a second, independent channel |
 | `index.js` | Orchestrator — run this (or cron it); `--verify` selects the 05:30 behavior, `--eod` selects the 16:25 LCC-only behavior |
 | `logger.js` | Shared append-to-`run.log` + console logging, plus the size-based rotation policy also applied to `cron.log` |
 | `scripts/captureEafSession.js` | One-time (or post-expiry) EAF dashboard login/session capture |
@@ -384,6 +419,17 @@ here — see the README's setup steps for those.
   only way to confirm the 05:00/05:30/16:25 cron jobs actually ran (as
   opposed to, say, the cron daemon itself being down, or the host being off)
   was to check `run.log` by hand.
+- **Email alerting (`email.js`) mirrors the Slack channel exactly** — every
+  `queueAlert` call site in `index.js` has a matching `queueEmailAlert` right
+  next to it (same message text, same events: gap/correction/failure/success,
+  plus every dashboard-image target once it's captured), and both queues are
+  flushed at the end of the same `run()` success/failure handler. The two
+  channels are independent: a Slack outage never blocks email and vice versa
+  — `captureAndPostDashboardImages` captures a dashboard screenshot once per
+  target, then posts to Slack and emails it as two separate best-effort
+  steps, so one channel failing never skips the other for the same image (and
+  never re-triggers the capture itself, which is the expensive step). Uses
+  Zoho Mail SMTP via `nodemailer`; see README §5b for setup.
 - **Alerting moved from WhatsApp (`whatsapp-web.js`) to a Slack Incoming
   Webhook** — a single stateless HTTPS POST (`fetch`, no new dependency)
   instead of a full headless-Chromium WhatsApp Web session. `pending-alerts.json`

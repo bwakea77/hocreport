@@ -9,6 +9,7 @@ run.lock
 gm-snapshot.json
 lcc-snapshot.json
 pending-alerts.json
+pending-emails.json
 evidence/
 sheet-images/
 # Real business data exports (e.g. HOC-REPORTS-final (1).xlsx) — never track

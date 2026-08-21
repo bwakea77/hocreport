@@ -13,6 +13,7 @@ const { runEalReportsEntry, correctEalValues, correctEalDataEntryValues, appendE
 const { saveGmSnapshot, loadGmSnapshot, compareGm } = require('./gmSnapshotStore');
 const { saveLccSnapshot, loadLccSnapshot, compareLcc } = require('./lccSnapshotStore');
 const { queueAlert, queueSuccessIfClean, flushAlerts } = require('./alert');
+const { queueEmailAlert, queueEmailSuccessIfClean, flushEmailAlerts, sendDashboardImageEmail } = require('./email');
 const { withRetryOnce } = require('./retry');
 const { captureSheetRangeImage, purgeOldDashboardImages, SheetExportAccessError } = require('./sheetImage');
 const { uploadImageToSlack } = require('./slackFiles');
@@ -146,7 +147,9 @@ async function alertOnGaps(diagnostics, hocReportsResult) {
   if (!parts.length) return;
   const warning = `⚠️ [${RUN_LABEL}] Run completed with gaps — ${parts.join('; ')}.`;
   log(`Degraded run: ${warning}`);
-  queueAlert(`${warning} (${new Date().toISOString()})`);
+  const alertText = `${warning} (${new Date().toISOString()})`;
+  queueAlert(alertText);
+  queueEmailAlert(alertText);
 }
 
 // Mirrors alertOnGaps above, for LCC. readKpiAndChannel (lccScraper.js) logs
@@ -161,7 +164,9 @@ async function alertOnLccGaps(label, data) {
   if (!gaps.length) return;
   const warning = `⚠️ [${RUN_LABEL}] LCC ${label} view completed with gaps — missing/unparseable: ${gaps.join(', ')}.`;
   log(`Degraded LCC run: ${warning}`);
-  queueAlert(`${warning} (${new Date().toISOString()})`);
+  const alertText = `${warning} (${new Date().toISOString()})`;
+  queueAlert(alertText);
+  queueEmailAlert(alertText);
 }
 
 async function alertLccFailure(err) {
@@ -170,7 +175,9 @@ async function alertLccFailure(err) {
     err instanceof SessionExpiredError
       ? `⚠️ [${RUN_LABEL}] LCC scrape failed — session expired, run scripts/captureLccSession.js to relink.`
       : `⚠️ [${RUN_LABEL}] LCC scrape/write failed: ${err.message}`;
-  queueAlert(`${message} (${new Date().toISOString()})`);
+  const alertText = `${message} (${new Date().toISOString()})`;
+  queueAlert(alertText);
+  queueEmailAlert(alertText);
 }
 
 // Scrapes the LCC (Transport P&L) dashboard's "Yesterday" AND "MTD" views
@@ -194,7 +201,9 @@ async function writeEalReportsEntry(sheets, targetDate, dateData, mtdData) {
   if (ealResult.errors.length) {
     const warning = `⚠️ [${RUN_LABEL}] EAL Data Entry write failed — ${ealResult.errors.join('; ')}.`;
     log(warning);
-    queueAlert(`${warning} (${new Date().toISOString()})`);
+    const alertText = `${warning} (${new Date().toISOString()})`;
+    queueAlert(alertText);
+    queueEmailAlert(alertText);
   }
 }
 
@@ -266,7 +275,9 @@ async function runLccVerify(sheets, targetDate) {
         ? 'no 05:00 LCC baseline existed — 05:30 figures written as primary'
         : `LCC corrected vs 05:00 run — ${diffs.join('; ')}`;
     log(`⚠️ ${correctionNote}`);
-    queueAlert(`⚠️ [0530] ${correctionNote} (${new Date().toISOString()})`);
+    const alertText = `⚠️ [0530] ${correctionNote} (${new Date().toISOString()})`;
+    queueAlert(alertText);
+    queueEmailAlert(alertText);
 
     await alertOnLccGaps('Yesterday', dateData);
     await alertOnLccGaps('MTD', mtdData);
@@ -281,7 +292,9 @@ async function writeAndCorrectGm(sheets, targetDate, gmByBranch, correctionNote)
   // collectCellUpdate/applyBatchUpdate usage there) — not wrapped again here.
   await correctGmValues(sheets, targetDate, gmByBranch);
   log(`⚠️ ${correctionNote}`);
-  queueAlert(`⚠️ [0530] ${correctionNote} (${new Date().toISOString()})`);
+  const alertText = `⚠️ [0530] ${correctionNote} (${new Date().toISOString()})`;
+  queueAlert(alertText);
+  queueEmailAlert(alertText);
   await alertOnGaps(diagnostics, hocReportsResult);
 }
 
@@ -349,13 +362,14 @@ function sleep(ms) {
 }
 
 // Screenshots each configured {tab, range} dashboard target (config.js's
-// sheetImages.targets) and posts it to Slack as an image, in the same run
-// that already sends the text notification. Best-effort per target: one
-// tab's screenshot/upload failing (stale/expired Google session, a renamed
-// tab, a Slack API hiccup) is logged and surfaced as its own Slack TEXT
-// warning via the existing webhook — it never blocks another target in the
-// same run, and never fails the run itself, since the underlying data write
-// this is meant to illustrate has already succeeded by the time this runs.
+// sheetImages.targets) and distributes it to Slack + email, in the same run
+// that already sends the text notification. Capture and each distribution
+// channel are independently best-effort: a capture failure (stale/expired
+// Google session, a renamed tab) skips both channels for that target, but a
+// Slack-only or email-only hiccup never blocks the other channel or another
+// target in the same run, and never fails the run itself, since the
+// underlying data write this is meant to illustrate has already succeeded by
+// the time this runs.
 async function captureAndPostDashboardImages(sheets, targets, targetDate) {
   if (!targets || !targets.length) return;
   fs.mkdirSync(config.sheetImages.outputDir, { recursive: true });
@@ -368,22 +382,54 @@ async function captureAndPostDashboardImages(sheets, targets, targetDate) {
       config.sheetImages.outputDir,
       `${isoDate(targetDate)}_${RUN_LABEL}_${target.tab}.png`
     );
+    const imageMeta = {
+      title: `${target.tab} (${RUN_LABEL})`,
+      comment: `📊 [${RUN_LABEL}] ${target.tab}!${target.range} — ${isoDate(targetDate)}`,
+    };
+
+    let captured = false;
     try {
-      await withRetryOnce(`Dashboard image capture for ${target.tab}!${target.range}`, async () => {
-        await captureSheetRangeImage(sheets, { spreadsheetId, tab: target.tab, range: target.range }, outputPath);
-        await uploadImageToSlack(outputPath, {
-          title: `${target.tab} (${RUN_LABEL})`,
-          comment: `📊 [${RUN_LABEL}] ${target.tab}!${target.range} — ${isoDate(targetDate)}`,
-        });
-      });
-      log(`Dashboard image: captured and posted ${target.tab}!${target.range}.`);
+      await withRetryOnce(`Dashboard image capture for ${target.tab}!${target.range}`, () =>
+        captureSheetRangeImage(sheets, { spreadsheetId, tab: target.tab, range: target.range }, outputPath)
+      );
+      captured = true;
+      log(`Dashboard image: captured ${target.tab}!${target.range}.`);
     } catch (err) {
       const message =
         err instanceof SheetExportAccessError
           ? `⚠️ [${RUN_LABEL}] Dashboard image capture denied for ${target.tab}!${target.range} — confirm the sheets-writer service account has Viewer+ access to ${spreadsheetId}: ${err.message}`
           : `⚠️ [${RUN_LABEL}] Dashboard image capture failed for ${target.tab}!${target.range}: ${err.message}`;
       log(message);
-      queueAlert(`${message} (${new Date().toISOString()})`);
+      const alertText = `${message} (${new Date().toISOString()})`;
+      queueAlert(alertText);
+      queueEmailAlert(alertText);
+    }
+    if (!captured) continue;
+
+    try {
+      await withRetryOnce(`Dashboard image Slack upload for ${target.tab}!${target.range}`, () =>
+        uploadImageToSlack(outputPath, imageMeta)
+      );
+      log(`Dashboard image: posted to Slack ${target.tab}!${target.range}.`);
+    } catch (err) {
+      const message = `⚠️ [${RUN_LABEL}] Dashboard image Slack post failed for ${target.tab}!${target.range}: ${err.message}`;
+      log(message);
+      const alertText = `${message} (${new Date().toISOString()})`;
+      queueAlert(alertText);
+      queueEmailAlert(alertText);
+    }
+
+    try {
+      await withRetryOnce(`Dashboard image email for ${target.tab}!${target.range}`, () =>
+        sendDashboardImageEmail(outputPath, imageMeta)
+      );
+      log(`Dashboard image: emailed ${target.tab}!${target.range}.`);
+    } catch (err) {
+      const message = `⚠️ [${RUN_LABEL}] Dashboard image email failed for ${target.tab}!${target.range}: ${err.message}`;
+      log(message);
+      const alertText = `${message} (${new Date().toISOString()})`;
+      queueAlert(alertText);
+      queueEmailAlert(alertText);
     }
   }
 }
@@ -401,7 +447,9 @@ async function writeEalDataEntryPreliminary(sheets, today, data) {
   } catch (err) {
     const warning = `⚠️ [${RUN_LABEL}] EAL Data Entry preliminary write failed — ${err.message}.`;
     log(warning);
-    queueAlert(`${warning} (${new Date().toISOString()})`);
+    const alertText = `${warning} (${new Date().toISOString()})`;
+    queueAlert(alertText);
+    queueEmailAlert(alertText);
   }
 }
 
@@ -456,11 +504,18 @@ run()
     // if a gap/correction warning already fired above, this is a no-op (see
     // queueSuccessIfClean); otherwise it's the only signal in Slack that the
     // run happened at all and found nothing to report.
-    queueSuccessIfClean(`✅ [${RUN_LABEL}] Run completed successfully. (${new Date().toISOString()})`);
+    const successText = `✅ [${RUN_LABEL}] Run completed successfully. (${new Date().toISOString()})`;
+    queueSuccessIfClean(successText);
+    queueEmailSuccessIfClean(successText);
     try {
       await flushAlerts();
     } catch (alertErr) {
       log(`Failed to send queued Slack alert(s): ${alertErr.message}`);
+    }
+    try {
+      await flushEmailAlerts();
+    } catch (emailErr) {
+      log(`Failed to send queued email alert(s): ${emailErr.message}`);
     }
     releaseLock();
     process.exit(0);
@@ -479,11 +534,18 @@ run()
       : err instanceof SessionExpiredError
         ? `❌ [${RUN_LABEL}] GM scrape failed — EAF session expired, run scripts/captureEafSession.js to relink.`
         : `❌ [${RUN_LABEL}] GM scrape/write pipeline failed: ${err.message}`;
-    queueAlert(`${message} (${new Date().toISOString()})`);
+    const failureText = `${message} (${new Date().toISOString()})`;
+    queueAlert(failureText);
+    queueEmailAlert(failureText);
     try {
       await flushAlerts();
     } catch (alertErr) {
       log(`Failed to send queued Slack alert(s): ${alertErr.message}`);
+    }
+    try {
+      await flushEmailAlerts();
+    } catch (emailErr) {
+      log(`Failed to send queued email alert(s): ${emailErr.message}`);
     }
     releaseLock();
     process.exit(1);
