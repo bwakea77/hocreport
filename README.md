@@ -535,8 +535,11 @@ here — see the README's setup steps for those.
     even now that every row is the same width, since nothing prevents a
     future reshape from hitting the same trap again.
   - Per-channel **Blended GM%** comes from drilling into a channel row (a
-    truck-level breakdown headed by "Blended GM: X%") — the channel card
-    itself only has Value/Share/delta, no GM. Browser back-navigation
+    truck-level breakdown headed by "GM%: X%", was "Blended GM: X%" before
+    the 2026-08-28 site redesign below) — the channel card itself only shows
+    GM inline for some channels (confirmed live 2026-08-31: never for
+    "Other"), so the drilldown stays the one source used for all three.
+    Browser back-navigation
     (`page.goBack()`) does not reliably restore this SPA's filter/period
     state after a drill-in (confirmed 2026-08-14 — the PERIOD bar and
     channel rows were simply gone afterward), so `lccScraper.js` gives each
@@ -567,3 +570,31 @@ here — see the README's setup steps for those.
     badge) now only nulls that one channel's value, instead of failing the
     whole match and nulling all three even though the other two rows were
     still perfectly readable on the same page.
+  - **EAL Dashboard site redesign, 2026-08-28/29 — two separate outages,
+    diagnosed and fixed 2026-08-31:**
+    1. The Revenue by Channel row's text layout changed (2026-08-28,
+       `run.log`): a channel row used to render as
+       Label/delta%/achievement%/revenue; it now renders as
+       Label/revenue/delta%/optional "GM X%" line, with revenue right after
+       the label instead of last. `matchChannelValue` silently returned
+       `null` for all three channels from this point on (each still logged
+       via the usual gap path, so `findLccGaps` kept alerting — nothing was
+       written with stale/wrong numbers). The channel drilldown's own header
+       also changed, from "Blended GM: X%" to "GM%: X%".
+    2. Separately, `lcc-session.json` (last captured 2026-08-21) expired
+       around 2026-08-29, which surfaced as every run timing out waiting for
+       the `Filters` button rather than the expected "session expired"
+       alert — `scrapeLccOnceWithFilter`'s login check
+       (`loginPasswordInput` count) runs immediately after `page.goto`,
+       before this SPA's JS has hydrated the login form into the DOM, so it
+       reads 0 and falls through; the login page only renders (and the
+       15s wait for `Filters` times out against it) a moment later. The
+       login check itself is unchanged and still correct once the page has
+       hydrated — re-running `scripts/captureLccSession.js` (README §4b)
+       is still the fix whenever this happens again, just don't rule out
+       "expired session" solely because `run.log` doesn't say so.
+    Fixed by re-running `scripts/captureLccSession.js` and updating
+    `matchChannelValue`/`readBlendedGm`'s regexes to the new layout (see
+    their comments in `lccScraper.js`) — verified live against both
+    "Yesterday" and "Today" with zero gaps. `test/lccScraper.test.js`'s
+    fixture text was updated to the new row order.

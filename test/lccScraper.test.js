@@ -22,17 +22,16 @@ const SAMPLE_BODY_LINES = [
   '10.1%',
   '',
   'External Transport',
-  '↑5.0%',
-  '40.0%',
   '500,000',
+  '↑5.0%',
+  'GM 40.0%',
   'Transit',
-  '↑5.0%',
-  '30.0%',
   '300,000',
-  'Other',
   '↑5.0%',
-  '30.0%',
+  'GM 30.0%',
+  'Other',
   '200,000',
+  '↑5.0%',
 ];
 const SAMPLE_BODY = SAMPLE_BODY_LINES.join('\n') + '\n';
 
@@ -51,8 +50,8 @@ test('readKpiAndChannel parses a well-formed page', () => {
 // see lccScraper.js's matchChannelValue comment.
 test('a layout change affecting one channel only nulls that channel, not the others', () => {
   const broken = SAMPLE_BODY.replace(
-    'External Transport\n↑5.0%\n40.0%\n500,000\n',
-    'External Transport (NEW)\n↑5.0%\n40.0%\n500,000\n'
+    'External Transport\n500,000\n↑5.0%\nGM 40.0%\n',
+    'External Transport (NEW)\n500,000\n↑5.0%\nGM 40.0%\n'
   );
   const result = readKpiAndChannel(broken);
   assert.equal(result.channel.externalTransport.value, null); // the affected row

@@ -45,8 +45,16 @@ function escapeRegExp(str) {
 // whole match and nulls out all three channels' values, even though the
 // other two rows are still perfectly readable on the same page. Matching each
 // channel independently means a change to one row only ever costs that row.
+//
+// Site redesign (first seen in run.log 2026-08-28): a channel row used to
+// render as Label / delta% / achievement% / revenue; it now renders as
+// Label / revenue / delta% / optional "GM X%" line — revenue is the first
+// number right after the label, not the last, and the trailing GM line isn't
+// always present (confirmed live 2026-08-31: "Other" never shows one), so
+// this only captures the revenue number and doesn't require anything after
+// it.
 function matchChannelValue(bodyText, label) {
-  const re = new RegExp(`${escapeRegExp(label)}\\n[↑↓][\\d.]+%\\n[\\d.]+%\\n([\\d,]+)`);
+  const re = new RegExp(`${escapeRegExp(label)}\\n([\\d,]+)\\n`);
   const m = bodyText.match(re);
   return m ? parseNumber(m[1]) : null;
 }
@@ -79,9 +87,12 @@ function readKpiAndChannel(bodyText) {
 }
 
 // Clicking a channel row drills into a truck-level breakdown for that
-// channel, headed by a "Blended GM: X%" figure — the one piece of
-// channel-level GM this dashboard exposes (the top-level Revenue by Channel
-// card only has value/share/delta, no GM). Browser back-navigation
+// channel, headed by a "GM%: X%" figure (was "Blended GM: X%" before the
+// 2026-08-28 site redesign) — the one piece of channel-level GM this
+// dashboard reliably exposes for every channel; the top-level Revenue by
+// Channel card only shows it inline for some channels (confirmed live
+// 2026-08-31: never for "Other"), so the drilldown stays the single source
+// used for all three. Browser back-navigation
 // (page.goBack()) does NOT reliably restore this SPA's filter/period state
 // after a drill-in (confirmed 2026-08-14 — the PERIOD bar and channel rows
 // were simply gone afterward), so each channel gets its own fresh page load
@@ -106,7 +117,7 @@ async function readBlendedGm(browser, filter, channelLabel) {
     for (let i = 0; i < 20; i++) {
       await page.waitForTimeout(1000);
       const text = await page.evaluate(() => document.body.innerText);
-      const m = text.match(/Blended GM: ([\d.-]+)%/);
+      const m = text.match(/GM%: ([\d.-]+)%/);
       if (!m) {
         previous = null;
         continue;
