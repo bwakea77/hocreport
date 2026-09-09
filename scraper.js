@@ -230,10 +230,42 @@ async function readGmSnapshot(page, expectedRangeLabel = null) {
   return { perBranch, overallRaw, rangeLabelPresent };
 }
 
-// A snapshot is only usable if it is populated AND was read off the range it
-// was supposed to be read off.
-function rejectSnapshot(snapshot) {
-  return isUnpopulatedSnapshot(snapshot) || snapshot.rangeLabelPresent === false;
+// True when two snapshots carry the same figures (ignoring the range-label
+// bookkeeping field).
+function sameFigures(a, b) {
+  if (!a || !b) return false;
+  return JSON.stringify(a.perBranch) === JSON.stringify(b.perBranch) && a.overallRaw === b.overallRaw;
+}
+
+// A snapshot is only usable if it is populated, was read off the range it was
+// supposed to be read off, and is not simply the pre-filter view that was on
+// screen before Apply Filter was clicked.
+//
+// That last one is the actual root cause behind both of the bad writes this
+// pipeline has made. Every scrape starts from loadDashboardFresh(), which
+// leaves the dashboard on its default "today" range; the custom range is
+// applied on top. The range *label* re-renders the moment Apply Filter is
+// clicked, but the table keeps showing the default view's numbers for a
+// while after that — so neither selectCustomRange's label wait nor
+// readGmSnapshot's label re-assert proves the figures belong to the
+// requested period, and readUntilStable is happy because a stale table is
+// perfectly stable.
+//
+// Caught red-handed 2026-09-09: two back-to-back scrapes of 2026-08-31
+// returned identical (correct) daily figures and different MTD figures —
+// one the default view's (Bunju 29.1%, Dodoma 18.6%, Kinyerezi 25.6%, Onja
+// 0.0%), one the real August MTD (23.1/22.8/16.2/28.5, matching cron.log's
+// 05:00 line exactly). It is also the most likely explanation for the 0.0%
+// MTD written on 2026-09-01 and 2026-09-06: those runs read at ~05:30, when
+// the default "today" view is a few hours into a day with no data in it yet
+// — an all-zero table that is not a placeholder at all, but a real reading
+// of the wrong day.
+function rejectSnapshot(snapshot, baseline = null) {
+  return (
+    isUnpopulatedSnapshot(snapshot) ||
+    snapshot.rangeLabelPresent === false ||
+    sameFigures(snapshot, baseline)
+  );
 }
 
 // selectCustomRange only confirms the date-range *label* has re-rendered —
@@ -346,16 +378,32 @@ async function scrapeGmOnce(targetDate, runLabel) {
       if (await branchesTab.count()) {
         await branchesTab.click().catch(() => {});
       }
+
+      // The default-range view the table shows before any custom range is
+      // applied, handed back so the reads below can reject it if the table is
+      // still showing it once a range has been applied.
+      //
+      // This has to wait for the table to actually populate. Reading it
+      // straight after the tab click returns an empty table (the branch rows
+      // haven't rendered), which matches nothing and silently disables the
+      // guard — measured doing exactly that on 2026-09-09, four "no row with
+      // exact branch name" lines per load and a baseline of nulls. If it
+      // still won't populate in time, hand back null: the guard is then off,
+      // but isUnpopulatedSnapshot and the range-label check still apply.
+      return readUntilStable(page, () => readGmSnapshot(page), {
+        settleTimeoutMs: 15000,
+        rejectIf: isUnpopulatedSnapshot,
+      }).catch(() => null);
     }
 
     const firstOfMonth = new Date(targetDate.getFullYear(), targetDate.getMonth(), 1);
 
-    await loadDashboardFresh();
+    const dailyBaseline = await loadDashboardFresh();
     await selectCustomRange(page, targetDate, targetDate);
     const dailyLabel = rangeLabelFor(targetDate, targetDate);
     const dailySnapshot = await readUntilStable(page, () => readGmSnapshot(page, dailyLabel), {
-      rejectIf: rejectSnapshot,
-      rejectDescription: 'unpopulated or showing a different date range',
+      rejectIf: (s) => rejectSnapshot(s, dailyBaseline),
+      rejectDescription: 'unpopulated, on a different date range, or still showing the pre-filter view',
     });
     const daily = dailySnapshot.perBranch;
     const overallDailyRaw = dailySnapshot.overallRaw;
@@ -365,12 +413,12 @@ async function scrapeGmOnce(targetDate, runLabel) {
     // has stabilized, so it reflects the numbers that ended up in the sheets.
     if (runLabel) await captureEvidence(page, targetDate, runLabel);
 
-    await loadDashboardFresh();
+    const mtdBaseline = await loadDashboardFresh();
     await selectCustomRange(page, firstOfMonth, targetDate);
     const mtdLabel = rangeLabelFor(firstOfMonth, targetDate);
     const mtdSnapshot = await readUntilStable(page, () => readGmSnapshot(page, mtdLabel), {
-      rejectIf: rejectSnapshot,
-      rejectDescription: 'unpopulated or showing a different date range',
+      rejectIf: (s) => rejectSnapshot(s, mtdBaseline),
+      rejectDescription: 'unpopulated, on a different date range, or still showing the pre-filter view',
     });
     const mtd = mtdSnapshot.perBranch;
     const overallMtdRaw = mtdSnapshot.overallRaw;
@@ -436,4 +484,4 @@ async function scrapeGm(targetDate, runLabel) {
   throw lastErr;
 }
 
-module.exports = { scrapeGm, SessionExpiredError, parsePercent, isUnpopulatedSnapshot, rejectSnapshot, readUntilStable, rangeLabelFor };
+module.exports = { scrapeGm, SessionExpiredError, parsePercent, isUnpopulatedSnapshot, rejectSnapshot, sameFigures, readUntilStable, rangeLabelFor };

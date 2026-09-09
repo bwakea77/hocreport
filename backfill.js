@@ -32,6 +32,13 @@ const { runEalReportsEntry, correctEalValues } = require('./ealReportsEntry');
 const { correctGmValues } = require('./hocReportsEntry');
 
 const DRY = process.argv.includes('--dry');
+// The two halves are independent repairs and can be run separately — the EAL
+// half was verified and written first, while the EAF half was still blocked on
+// the dashboard's flaky custom-range reads.
+const ONLY_EAL = process.argv.includes('--eal-only');
+const ONLY_EAF = process.argv.includes('--eaf-only');
+const DO_EAL = !ONLY_EAF;
+const DO_EAF = !ONLY_EAL;
 const d = (y, m, day) => new Date(y, m - 1, day);
 const firstOf = (date) => new Date(date.getFullYear(), date.getMonth(), 1);
 
@@ -69,7 +76,7 @@ async function scrapeEal(date) {
   // Scrape everything first, so a failure part-way through leaves the sheets
   // untouched rather than half-repaired.
   const eal = [];
-  for (const date of EAL_DATES) {
+  for (const date of DO_EAL ? EAL_DATES : []) {
     const { dateData, mtdData } = await scrapeEal(date);
     const gaps = [...findLccGaps(dateData), ...findLccGaps(mtdData)];
     log(`EAL ${isoDate(date)}: rev=${dateData.revenue.actual} gm=${dateData.grossMargin.actual} ebitda=${dateData.ebitda.actual} | mtd rev=${mtdData.revenue.actual} gm=${mtdData.grossMargin.actual}${gaps.length ? ` | GAPS: ${gaps.join(', ')}` : ''}`);
@@ -80,7 +87,7 @@ async function scrapeEal(date) {
   }
 
   const eaf = [];
-  for (const date of EAF_MTD_DATES) {
+  for (const date of DO_EAF ? EAF_MTD_DATES : []) {
     const gm = await twice(`EAF ${isoDate(date)} GM`, () => scrapeGm(date, null));
     // Only the MTD column was corrupted; the daily column was written from a
     // stable read and is correct. Nulling daily makes collectCellUpdate skip
@@ -112,9 +119,11 @@ async function scrapeEal(date) {
 
   // LCC_SNAPSHOT is a single "latest state" block, not per-date history —
   // write it once, from the most recent date backfilled.
-  const latest = eal[eal.length - 1];
-  await writeLccYesterdaySnapshot(sheets, latest.date, latest.dateData, latest.mtdData);
-  log(`LCC_SNAPSHOT (Yesterday + MTD) refreshed from ${isoDate(latest.date)}.`);
+  if (eal.length) {
+    const latest = eal[eal.length - 1];
+    await writeLccYesterdaySnapshot(sheets, latest.date, latest.dateData, latest.mtdData);
+    log(`LCC_SNAPSHOT (Yesterday + MTD) refreshed from ${isoDate(latest.date)}.`);
+  }
 
   for (const { date, mtdOnly } of eaf) {
     await correctGmValues(sheets, date, mtdOnly);

@@ -2,7 +2,7 @@
 // sheet on 2026-09-01 and 2026-09-06. See isUnpopulatedSnapshot in scraper.js.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { isUnpopulatedSnapshot, readUntilStable, rejectSnapshot, rangeLabelFor } = require('../scraper');
+const { isUnpopulatedSnapshot, readUntilStable, rejectSnapshot, sameFigures, rangeLabelFor } = require('../scraper');
 
 const snapshot = (bunju, dodoma, kinyerezi, onja, overallRaw) => ({
   perBranch: { BUNJU: bunju, DODOMA: dodoma, KINYEREZI: kinyerezi, ONJA: onja },
@@ -86,6 +86,40 @@ test('readUntilStable waits out a stale range and returns the correct one', asyn
   let i = 0;
   const result = await readUntilStable(fakePage(), async () => reads[i++], { intervalMs: 0, rejectIf: rejectSnapshot });
   assert.equal(result.overallRaw, '21.0%');
+});
+
+test('rejectSnapshot rejects a read still showing the pre-filter view', () => {
+  // The 2026-09-09 catch: two back-to-back scrapes of 2026-08-31 returned
+  // identical daily figures but different MTD ones — read 1 handed back the
+  // default "today" view (Bunju 29.1%, Dodoma 18.6%, Kinyerezi 25.6%, Onja
+  // 0.0%), read 2 the real August MTD. Populated, stable, right label, wrong
+  // period; only the baseline comparison separates them.
+  const baseline = { ...snapshot(0.291, 0.186, 0.256, 0, '25.5%'), rangeLabelPresent: true };
+  const stillStale = { ...snapshot(0.291, 0.186, 0.256, 0, '25.5%'), rangeLabelPresent: true };
+  const applied = { ...snapshot(0.231, 0.228, 0.162, 0.285, '21.0%'), rangeLabelPresent: true };
+  assert.equal(rejectSnapshot(stillStale, baseline), true);
+  assert.equal(rejectSnapshot(applied, baseline), false);
+  // With no usable baseline the check simply doesn't apply.
+  assert.equal(rejectSnapshot(stillStale, null), false);
+});
+
+test('readUntilStable waits out the pre-filter view and returns the applied range', async () => {
+  const baseline = { ...snapshot(0.291, 0.186, 0.256, 0, '25.5%'), rangeLabelPresent: true };
+  const applied = { ...snapshot(0.231, 0.228, 0.162, 0.285, '21.0%'), rangeLabelPresent: true };
+  const reads = [baseline, baseline, applied, applied];
+  let i = 0;
+  const result = await readUntilStable(fakePage(), async () => reads[i++], {
+    intervalMs: 0,
+    rejectIf: (s) => rejectSnapshot(s, baseline),
+  });
+  assert.equal(result.overallRaw, '21.0%');
+});
+
+test('sameFigures ignores the range-label bookkeeping field', () => {
+  const a = { ...snapshot(0.1, 0.2, 0.3, 0.4, '2.5%'), rangeLabelPresent: true };
+  const b = { ...snapshot(0.1, 0.2, 0.3, 0.4, '2.5%'), rangeLabelPresent: false };
+  assert.equal(sameFigures(a, b), true);
+  assert.equal(sameFigures(a, null), false);
 });
 
 test('a placeholder read cannot pair with a later real read to look stable', async () => {
