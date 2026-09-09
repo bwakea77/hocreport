@@ -21,9 +21,15 @@ function parsePercent(text) {
   return num / 100;
 }
 
-async function scrapeGmForCurrentView(page) {
+// `quiet` suppresses the per-branch "missing" logging. Used for the
+// pre-filter baseline read, which deliberately polls a table that is still
+// rendering — without it, each baseline capture emits four "no row with exact
+// branch name" lines per poll, up to sixty per dashboard load, all of them
+// describing a state that is entirely expected there.
+async function scrapeGmForCurrentView(page, { quiet = false } = {}) {
   const { branchTableRows, gmCellIndexInRow, branchNameCellIndexInRow } = config.eaf.selectors;
   const values = {};
+  const note = (msg) => { if (!quiet) log(msg); };
 
   // Reads every row's branch-name cell once and matches on exact (trimmed)
   // text, rather than Playwright's hasText substring match against the
@@ -53,7 +59,7 @@ async function scrapeGmForCurrentView(page) {
     try {
       name = (await rowLocator.nth(i).locator('td').nth(branchNameCellIndexInRow).innerText({ timeout: 2000 })).trim();
     } catch (err) {
-      log(`Scraper: could not read branch-name cell for row ${i}: ${err.message}`);
+      note(`Scraper: could not read branch-name cell for row ${i}: ${err.message}`);
     }
     rowBranchNames.push(name);
   }
@@ -61,10 +67,10 @@ async function scrapeGmForCurrentView(page) {
   for (const { dashboardName, sheetTab } of config.branches) {
     const matchingIndices = rowBranchNames.reduce((acc, name, i) => (name === dashboardName ? [...acc, i] : acc), []);
     if (matchingIndices.length > 1) {
-      log(`Scraper: expected exactly one row for ${dashboardName}, found ${matchingIndices.length}; using the first match.`);
+      note(`Scraper: expected exactly one row for ${dashboardName}, found ${matchingIndices.length}; using the first match.`);
     }
     if (matchingIndices.length === 0) {
-      log(`Scraper: no row with exact branch name "${dashboardName}" found; GM value will be missing.`);
+      note(`Scraper: no row with exact branch name "${dashboardName}" found; GM value will be missing.`);
       values[sheetTab] = null;
       continue;
     }
@@ -74,11 +80,11 @@ async function scrapeGmForCurrentView(page) {
     try {
       text = await gmCell.locator('span').first().innerText({ timeout: 5000 });
     } catch (err) {
-      log(`Scraper: could not read GM cell for ${dashboardName}: ${err.message}`);
+      note(`Scraper: could not read GM cell for ${dashboardName}: ${err.message}`);
     }
     const value = parsePercent(text);
     if (value === null) {
-      log(`Scraper: GM value missing/unparseable for ${dashboardName} (raw="${text}")`);
+      note(`Scraper: GM value missing/unparseable for ${dashboardName} (raw="${text}")`);
     }
     values[sheetTab] = value;
   }
@@ -208,8 +214,8 @@ async function selectCustomRange(page, startDate, endDate) {
 // Reads both the per-branch table GM and the overall KPI card together, so
 // a "stable" snapshot means both agree across two consecutive reads — not
 // just one of the two.
-async function readGmSnapshot(page, expectedRangeLabel = null) {
-  const perBranch = await scrapeGmForCurrentView(page);
+async function readGmSnapshot(page, expectedRangeLabel = null, { quiet = false } = {}) {
+  const perBranch = await scrapeGmForCurrentView(page, { quiet });
   const overallRaw = await scrapeOverallGm(page);
   // Re-assert the applied range is *still* the one on screen at the moment
   // these values were read. selectCustomRange confirms the label once, right
@@ -390,7 +396,7 @@ async function scrapeGmOnce(targetDate, runLabel) {
       // exact branch name" lines per load and a baseline of nulls. If it
       // still won't populate in time, hand back null: the guard is then off,
       // but isUnpopulatedSnapshot and the range-label check still apply.
-      return readUntilStable(page, () => readGmSnapshot(page), {
+      return readUntilStable(page, () => readGmSnapshot(page, null, { quiet: true }), {
         settleTimeoutMs: 15000,
         rejectIf: isUnpopulatedSnapshot,
       }).catch(() => null);
