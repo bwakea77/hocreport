@@ -15,6 +15,7 @@ const { saveLccSnapshot, loadLccSnapshot, compareLcc } = require('./lccSnapshotS
 const { queueAlert, queueSuccessIfClean, flushAlerts } = require('./alert');
 const { queueEmailAlert, queueEmailSuccessIfClean, flushEmailAlerts, sendDashboardImageEmail } = require('./email');
 const { withRetryOnce } = require('./retry');
+const { sessionAgeDays } = require('./sessionCapture');
 const { captureSheetRangeImage, purgeOldDashboardImages, SheetExportAccessError } = require('./sheetImage');
 const { uploadImageToSlack } = require('./slackFiles');
 
@@ -460,9 +461,23 @@ async function writeEalDataEntryPreliminary(sheets, today, data) {
 // its finalized scrape — see the correction call in runLccPrimary).
 // Otherwise independent of the EAF/DAILY_SNAPSHOT pipeline entirely — no EAF
 // scrape, no other HOC-REPORTS-final write.
+// Records how old each stored session is at the top of every run. Expiry is
+// detected for real mid-run (waitForDashboardOrLogin) and now self-heals
+// (captureSession), so this is deliberately a log line and not an alert —
+// its job is forensic. When the EAL session died on 2026-09-08 the logs gave
+// no way to tell a dead cookie from a broken selector without going back to
+// the file's mtime by hand.
+function logSessionAges() {
+  for (const site of ['eaf', 'lcc']) {
+    const age = sessionAgeDays(site);
+    log(age === null ? `Session ${site.toUpperCase()}: none stored.` : `Session ${site.toUpperCase()}: ${age} day(s) old.`);
+  }
+}
+
 async function runEod() {
   const today = eatCalendarDate(0);
   log(`Run started (${RUN_LABEL}). Target date = ${today.toDateString()}`);
+  logSessionAges();
 
   const data = await scrapeLcc('Today', today, `LCC-${RUN_LABEL}`);
   const sheets = await getSheetsClient();
@@ -490,6 +505,7 @@ async function run() {
 
   const targetDate = eatCalendarDate(1);
   log(`Run started (${RUN_LABEL}). Target date = ${targetDate.toDateString()}`);
+  logSessionAges();
 
   if (isVerifyRun) {
     await runVerify(targetDate);

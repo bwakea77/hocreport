@@ -4,6 +4,8 @@ const config = require('./config');
 const { log } = require('./logger');
 const { captureEvidence } = require('./evidence');
 const { SessionExpiredError } = require('./scraper');
+const { waitForDashboardOrLogin } = require('./dashboardReady');
+const { captureSession } = require('./sessionCapture');
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -108,7 +110,17 @@ async function readBlendedGm(browser, filter, channelLabel) {
   try {
     const page = await context.newPage();
     await page.goto(config.lcc.url, { waitUntil: 'load', timeout: 30000 });
-    await page.locator(config.lcc.selectors.filtersButton).first().waitFor({ state: 'attached', timeout: 15000 });
+    // Same login/dashboard race as the main view — a session that expires
+    // mid-scrape (or between the main read and these three drilldowns) would
+    // otherwise surface here as a Filters-button timeout too.
+    if (
+      (await waitForDashboardOrLogin(page, {
+        dashboardSelector: config.lcc.selectors.filtersButton,
+        loginSelector: config.lcc.selectors.loginPasswordInput,
+      })) === 'login'
+    ) {
+      throw new SessionExpiredError('LCC session expired — redirected to login page.');
+    }
     await filter.apply(page);
 
     await page.locator('text=' + channelLabel).first().click();
@@ -271,12 +283,20 @@ async function scrapeLccOnceWithFilter(filter, runLabel, evidenceDate) {
 
     await page.goto(config.lcc.url, { waitUntil: 'load', timeout: 30000 });
 
-    const stillOnLogin = await page.locator(config.lcc.selectors.loginPasswordInput).count();
-    if (stillOnLogin > 0) {
+    // Race the login form against the dashboard instead of counting password
+    // inputs the instant goto() resolved — at `load` this SPA has rendered
+    // neither, so that check passed on an expired session and the run then
+    // died 15s later on the missing Filters button, mislabelling every
+    // expiry as a selector timeout. See dashboardReady.js; this is the bug
+    // that hid the 2026-09-08 EAL outage for two days.
+    if (
+      (await waitForDashboardOrLogin(page, {
+        dashboardSelector: config.lcc.selectors.filtersButton,
+        loginSelector: config.lcc.selectors.loginPasswordInput,
+      })) === 'login'
+    ) {
       throw new SessionExpiredError('LCC session expired — redirected to login page.');
     }
-
-    await page.locator(config.lcc.selectors.filtersButton).first().waitFor({ state: 'attached', timeout: 15000 });
     await filter.apply(page);
 
     if (runLabel) await captureEvidence(page, evidenceDate, runLabel);
@@ -300,11 +320,31 @@ async function scrapeLccOnceWithFilter(filter, runLabel, evidenceDate) {
 async function scrapeLccWithRetry(filter, evidenceDate, runLabel) {
   const { attempts, delayMs } = config.lcc.retry;
   let lastErr;
+  let relinked = false;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
       return await scrapeLccOnceWithFilter(filter, runLabel, evidenceDate);
     } catch (err) {
-      if (err instanceof SessionExpiredError) throw err;
+      if (err instanceof SessionExpiredError) {
+        // Re-link once, in-run. This session expired overnight 2026-09-07→08
+        // and every run failed until it was re-captured by hand on 09-09 —
+        // two days of EAL reporting lost to a cookie with (going by the
+        // 08-31 and 09-08 expiries) roughly a week's life. Login here is
+        // unattended-safe: plain email/password, no 2FA (sessionCapture.js).
+        // Guarded to one attempt so a wrong/locked credential fails the run
+        // rather than hammering the login form.
+        if (relinked) throw err;
+        relinked = true;
+        log('LCC scraper: session expired — re-capturing it and retrying.');
+        try {
+          await captureSession('lcc');
+        } catch (captureErr) {
+          log(`LCC scraper: session re-capture failed: ${captureErr.message}`);
+          throw err;
+        }
+        attempt--; // the re-link shouldn't cost one of the transient-failure retries
+        continue;
+      }
       lastErr = err;
       const willRetry = attempt < attempts;
       log(`LCC scraper: attempt ${attempt}/${attempts} failed (${err.message})${willRetry ? ', retrying...' : ', giving up.'}`);

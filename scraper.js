@@ -3,6 +3,8 @@ const { chromium } = require('playwright');
 const config = require('./config');
 const { log } = require('./logger');
 const { captureEvidence } = require('./evidence');
+const { waitForDashboardOrLogin } = require('./dashboardReady');
+const { captureSession } = require('./sessionCapture');
 
 class SessionExpiredError extends Error {}
 
@@ -34,8 +36,22 @@ async function scrapeGmForCurrentView(page) {
   const rowBranchNames = [];
   for (let i = 0; i < rowCount; i++) {
     let name = '';
+    // Check the row actually has a branch-name cell before trying to read
+    // one, rather than spending a 5s timeout per row discovering it doesn't.
+    // While the table is still rendering it carries a batch of skeleton rows
+    // with no populated <td>s — observed on the 2026-09-08 and -09 runs as
+    // rowCount 9 with rows 4-8 unreadable, against the 4 real rows the
+    // finished table settles to (confirmed live 2026-09-09). The old code
+    // burned 25s per run on that and emitted five alarming log lines for
+    // what is a normal intermediate state; readUntilStable is what actually
+    // waits for the table to finish.
+    const cellCount = await rowLocator.nth(i).locator('td').count();
+    if (cellCount <= branchNameCellIndexInRow) {
+      rowBranchNames.push('');
+      continue;
+    }
     try {
-      name = (await rowLocator.nth(i).locator('td').nth(branchNameCellIndexInRow).innerText({ timeout: 5000 })).trim();
+      name = (await rowLocator.nth(i).locator('td').nth(branchNameCellIndexInRow).innerText({ timeout: 2000 })).trim();
     } catch (err) {
       log(`Scraper: could not read branch-name cell for row ${i}: ${err.message}`);
     }
@@ -149,6 +165,14 @@ async function waitForApplyFilterEnabled(page) {
 // applies it — used for both the daily and MTD reads so the scraper never
 // depends on the dashboard's "Today"/"This Month" presets, which mean
 // different calendar days depending on when the script happens to run.
+// The range label the dashboard renders for an applied custom range. Shared
+// by selectCustomRange (which waits for it after applying) and readGmSnapshot
+// (which re-asserts it is still on screen at the moment values are read), so
+// the two can never drift apart.
+function rangeLabelFor(startDate, endDate) {
+  return `${formatRangeLabel(startDate)} - ${formatRangeLabel(endDate)} ${endDate.getFullYear()}`;
+}
+
 async function selectCustomRange(page, startDate, endDate) {
   await page.locator(config.eaf.selectors.dateRangeSelect).first().selectOption(config.eaf.selectors.customRangeOptionValue);
   await page.waitForTimeout(800);
@@ -163,7 +187,7 @@ async function selectCustomRange(page, startDate, endDate) {
   // the table content briefly (or, during a flaky load, not-so-briefly)
   // still reflects the previous selection. Poll rather than trust one fixed
   // wait.
-  const expectedLabel = `${formatRangeLabel(startDate)} - ${formatRangeLabel(endDate)} ${endDate.getFullYear()}`;
+  const expectedLabel = rangeLabelFor(startDate, endDate);
   let confirmed = false;
   for (let i = 0; i < 8 && !confirmed; i++) {
     const bodyText = await page.evaluate(() => document.body.innerText);
@@ -184,10 +208,32 @@ async function selectCustomRange(page, startDate, endDate) {
 // Reads both the per-branch table GM and the overall KPI card together, so
 // a "stable" snapshot means both agree across two consecutive reads — not
 // just one of the two.
-async function readGmSnapshot(page) {
+async function readGmSnapshot(page, expectedRangeLabel = null) {
   const perBranch = await scrapeGmForCurrentView(page);
   const overallRaw = await scrapeOverallGm(page);
-  return { perBranch, overallRaw };
+  // Re-assert the applied range is *still* the one on screen at the moment
+  // these values were read. selectCustomRange confirms the label once, right
+  // after clicking Apply Filter, and then trusts it — but the table can
+  // revert to the dashboard's default "today" view after that check passes.
+  // Observed 2026-09-09: a backfill read of the 01 Aug - 31 Aug range came
+  // back with the default view's figures (Bunju 29.1%, Dodoma 18.6%,
+  // Kinyerezi 25.6%, Onja 0.0%) and nothing caught it; an immediate re-run of
+  // the identical call returned the correct August MTD (23.1/22.8/16.2/28.5)
+  // and matched the 05:00 figures in cron.log exactly. Silently reading the
+  // wrong period is the same class of bug as reading the placeholder, and
+  // just as invisible downstream, so it is rejected the same way.
+  let rangeLabelPresent = true;
+  if (expectedRangeLabel) {
+    const bodyText = await page.evaluate(() => document.body.innerText);
+    rangeLabelPresent = bodyText.includes(expectedRangeLabel);
+  }
+  return { perBranch, overallRaw, rangeLabelPresent };
+}
+
+// A snapshot is only usable if it is populated AND was read off the range it
+// was supposed to be read off.
+function rejectSnapshot(snapshot) {
+  return isUnpopulatedSnapshot(snapshot) || snapshot.rangeLabelPresent === false;
 }
 
 // selectCustomRange only confirms the date-range *label* has re-rendered —
@@ -199,15 +245,63 @@ async function readGmSnapshot(page) {
 // number has actually finished updating for the applied range, not just the
 // label. If it never settles, throw so the outer retry reloads with a fresh
 // browser instead of trusting a possibly-stale figure.
-async function readUntilStable(page, readFn, { maxAttempts = 4, intervalMs = 1000 } = {}) {
-  let previous = await readFn();
-  for (let i = 1; i < maxAttempts; i++) {
-    await page.waitForTimeout(intervalMs);
+//
+// `rejectIf` marks a reading as "not a reading at all" — see
+// isUnpopulatedSnapshot. Stability alone can't catch that case: the
+// placeholder is perfectly stable, which is exactly how it got written to
+// the sheet twice. A rejected read also resets `previous`, so two
+// consecutive placeholders can never agree their way through.
+//
+// Polls to a deadline rather than a fixed 4 reads (~3s). The MTD view
+// queries a whole month and is routinely slower to populate than the
+// single-day view — 3s was not enough headroom for it, which is why the
+// placeholder kept being read as final.
+async function readUntilStable(
+  page,
+  readFn,
+  { intervalMs = 1000, settleTimeoutMs = 30000, rejectIf = null, rejectDescription = 'unpopulated' } = {}
+) {
+  const deadline = Date.now() + settleTimeoutMs;
+  let previous = null;
+  let sawRejected = false;
+  while (Date.now() < deadline) {
     const current = await readFn();
-    if (JSON.stringify(current) === JSON.stringify(previous)) return current;
+    if (rejectIf && rejectIf(current)) {
+      sawRejected = true;
+      previous = null;
+      await page.waitForTimeout(intervalMs);
+      continue;
+    }
+    if (previous !== null && JSON.stringify(current) === JSON.stringify(previous)) return current;
     previous = current;
+    await page.waitForTimeout(intervalMs);
   }
-  throw new Error('GM reading never stabilized across repeated reads — dashboard likely still updating.');
+  throw new Error(
+    `GM reading never stabilized within ${settleTimeoutMs}ms — dashboard ${sawRejected ? `stayed ${rejectDescription}` : 'likely still updating'}.`
+  );
+}
+
+// True when a snapshot is the dashboard's "range applied, numbers not back
+// yet" state rather than a real reading.
+//
+// That state renders every GM figure as 0.0%, and it is *stable*, so
+// readUntilStable used to hand it back as a good reading. On 2026-09-01 and
+// 2026-09-06 the 05:30 verify run read exactly this and wrote zeros over the
+// correct MTD GM the 05:00 run had already put in the sheet — BUNJU 23.1% →
+// 0.0%, OVERALL 21.0% → 0.0%, and so on. collectCellUpdate (manualEntryRows)
+// already refuses to write a null, but 0 is a number and sailed straight
+// through it.
+//
+// Deliberately requires *every* figure to be zero/absent at once. A single
+// branch really can be 0.0% — confirmed live on 2026-09-09, where "Onja
+// Channel" was 0.0% while the other three were 19.7%/14.1%/8.2% — so
+// rejecting any zero would throw away real data. All four branches AND the
+// overall KPI card reading exactly zero simultaneously is the placeholder,
+// never a real month.
+function isUnpopulatedSnapshot({ perBranch, overallRaw }) {
+  const values = config.branches.map(({ sheetTab }) => perBranch[sheetTab]);
+  values.push(parsePercent(overallRaw));
+  return values.every((v) => v === null || v === 0);
 }
 
 async function scrapeGmOnce(targetDate, runLabel) {
@@ -233,14 +327,20 @@ async function scrapeGmOnce(targetDate, runLabel) {
     async function loadDashboardFresh() {
       await page.goto(config.eaf.url, { waitUntil: 'load', timeout: 30000 });
 
-      if (/\/login/.test(page.url())) {
+      // Race the login form against the dashboard rather than testing the
+      // URL the instant goto() resolved — this SPA can swap in the login
+      // form without a URL change, and at `load` neither has rendered yet.
+      // See dashboardReady.js for what that cost on the LCC side.
+      // Doubles as the "stuck on Loading dashboard..." guard the URL check
+      // used to be paired with: if neither appears, this throws and the
+      // outer retry reloads with a fresh browser.
+      const outcome = await waitForDashboardOrLogin(page, {
+        dashboardSelector: config.eaf.selectors.dateRangeSelect,
+        loginSelector: config.eaf.selectors.loginPasswordInput,
+      });
+      if (outcome === 'login') {
         throw new SessionExpiredError('EAF session expired — redirected to login page.');
       }
-
-      // The dashboard sometimes sits on a "Loading dashboard..." screen for
-      // a while — fail fast here so the outer retry can reload with a
-      // fresh browser instead of burning the whole attempt on one timeout.
-      await page.locator(config.eaf.selectors.dateRangeSelect).first().waitFor({ state: 'attached', timeout: 15000 });
 
       const branchesTab = page.locator(config.eaf.selectors.branchesPerformanceTab).first();
       if (await branchesTab.count()) {
@@ -252,7 +352,11 @@ async function scrapeGmOnce(targetDate, runLabel) {
 
     await loadDashboardFresh();
     await selectCustomRange(page, targetDate, targetDate);
-    const dailySnapshot = await readUntilStable(page, () => readGmSnapshot(page));
+    const dailyLabel = rangeLabelFor(targetDate, targetDate);
+    const dailySnapshot = await readUntilStable(page, () => readGmSnapshot(page, dailyLabel), {
+      rejectIf: rejectSnapshot,
+      rejectDescription: 'unpopulated or showing a different date range',
+    });
     const daily = dailySnapshot.perBranch;
     const overallDailyRaw = dailySnapshot.overallRaw;
 
@@ -263,7 +367,11 @@ async function scrapeGmOnce(targetDate, runLabel) {
 
     await loadDashboardFresh();
     await selectCustomRange(page, firstOfMonth, targetDate);
-    const mtdSnapshot = await readUntilStable(page, () => readGmSnapshot(page));
+    const mtdLabel = rangeLabelFor(firstOfMonth, targetDate);
+    const mtdSnapshot = await readUntilStable(page, () => readGmSnapshot(page, mtdLabel), {
+      rejectIf: rejectSnapshot,
+      rejectDescription: 'unpopulated or showing a different date range',
+    });
     const mtd = mtdSnapshot.perBranch;
     const overallMtdRaw = mtdSnapshot.overallRaw;
 
@@ -292,11 +400,31 @@ async function scrapeGmOnce(targetDate, runLabel) {
 async function scrapeGm(targetDate, runLabel) {
   const { attempts, delayMs } = config.eaf.retry;
   let lastErr;
+  let relinked = false;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
       return await scrapeGmOnce(targetDate, runLabel);
     } catch (err) {
-      if (err instanceof SessionExpiredError) throw err;
+      if (err instanceof SessionExpiredError) {
+        // Re-link once, in-run, rather than failing every run until a human
+        // notices the alert and runs scripts/captureEafSession.js by hand —
+        // that manual-only loop is what cost two days of EAL reporting when
+        // the LCC session expired on 2026-09-08. Login is unattended-safe on
+        // both sites (see sessionCapture.js). Guarded to a single attempt so
+        // a genuinely wrong/locked credential fails the run instead of
+        // hammering the login form.
+        if (relinked) throw err;
+        relinked = true;
+        log('Scraper: EAF session expired — re-capturing it and retrying.');
+        try {
+          await captureSession('eaf');
+        } catch (captureErr) {
+          log(`Scraper: EAF session re-capture failed: ${captureErr.message}`);
+          throw err;
+        }
+        attempt--; // the re-link shouldn't cost one of the transient-failure retries
+        continue;
+      }
       lastErr = err;
       const willRetry = attempt < attempts;
       log(
@@ -308,4 +436,4 @@ async function scrapeGm(targetDate, runLabel) {
   throw lastErr;
 }
 
-module.exports = { scrapeGm, SessionExpiredError, parsePercent };
+module.exports = { scrapeGm, SessionExpiredError, parsePercent, isUnpopulatedSnapshot, rejectSnapshot, readUntilStable, rangeLabelFor };
