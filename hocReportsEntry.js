@@ -377,7 +377,7 @@ async function correctMetricsValues(sheets, targetDate, metricsByBranch) {
 
   for (const sheetTab of DATA_ENTRY_BRANCH_ORDER) {
     const metrics = metricsByBranch[sheetTab];
-    if (!metrics || metrics.total.rowCount === 0) continue;
+    if (!metrics || metrics.products.length === 0) continue;
 
     const label = dataEntryLabelFor(sheetTab);
     const row = dataEntryScan.rowsByKey.get(`${dateSerial}|${label}`);
