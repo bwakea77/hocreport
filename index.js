@@ -5,7 +5,8 @@ const { log, rotateFileIfNeeded } = require('./logger');
 const { isoDate, eatCalendarDate } = require('./dateUtils');
 const { scrapeGm, SessionExpiredError } = require('./scraper');
 const { scrapeLcc, findLccGaps } = require('./lccScraper');
-const { getSheetsClient } = require('./sheetsClient');
+const { getSheetsClient, getBranchRawRows } = require('./sheetsClient');
+const { computeBranchDailyMetrics } = require('./metrics');
 const { runDailySnapshot } = require('./dailySnapshot');
 const { writeLccYesterdaySnapshot, writeLccTodaySnapshot } = require('./lccSnapshot');
 const { runHocReportsEntry, correctGmValues, correctMetricsValues } = require('./hocReportsEntry');
@@ -35,7 +36,14 @@ const { uploadImageToSlack } = require('./slackFiles');
 // never linger past the following morning.
 const isEodRun = process.argv.includes('--eod');
 const isVerifyRun = process.argv.includes('--verify');
-const RUN_LABEL = isEodRun ? '1625' : isVerifyRun ? '0530' : '0500';
+// 06:00 and 06:55 — silent catchup runs for the case a branch's raw
+// IMPORTRANGE import still hadn't landed by 05:30 (see runCatchup below).
+// Each carries its own explicit label (--catchup=0600 / --catchup=0655)
+// rather than guessing from the wall clock, since cron can fire a few
+// minutes late.
+const catchupArg = process.argv.find((a) => a.startsWith('--catchup='));
+const isCatchupRun = Boolean(catchupArg);
+const RUN_LABEL = isEodRun ? '1625' : isVerifyRun ? '0530' : isCatchupRun ? catchupArg.split('=')[1] : '0500';
 
 const LOCK_PATH = path.join(__dirname, 'run.lock');
 
@@ -367,6 +375,61 @@ async function runVerify(targetDate) {
   await captureAndPostDashboardImages(sheets, config.sheetImages.targets.morning, targetDate);
 }
 
+// True whenever runCatchup below decided there was nothing worth doing (or
+// nothing new got fixed) — checked in run()'s .then() handler to skip the
+// "run completed successfully" ping that every other run mode always sends.
+// 06:00/06:55 exist specifically to stay invisible on an ordinary morning;
+// posting a green Slack line twice more for a run that did nothing would be
+// exactly the noise this was built to avoid (2026-09-13 design discussion).
+let suppressSuccessNotification = false;
+
+// 06:00 and 06:55 — silent catchup runs for the one gap this pipeline can't
+// close by retrying immediately: a branch's raw IMPORTRANGE import still
+// hadn't landed by 05:00, and GM happened to be stable at 05:30 so
+// verifyMetricsOnly's one attempt (runVerify) was the only recheck that
+// morning got. Deliberately narrow — EAF metrics gaps only, not LCC
+// failures or missing GM, since re-fetching raw rows is a plain values.get
+// (no browser), cheap enough to check on a schedule, unlike a full
+// Playwright re-scrape.
+//
+// Both 06:00 and 06:55 run the exact same check; there's no state passed
+// between them. If 06:00 fixes everything, 06:55's own fresh re-check finds
+// no gap left (the sheet it reads was already corrected) and exits just as
+// silently — the "06:55 only acts if 06:00 still had a gap" behavior falls
+// out of re-checking real state rather than needing its own tracking.
+async function runCatchup(targetDate) {
+  const sheets = await getSheetsClient();
+  const metricsByBranch = {};
+  for (const { sheetTab } of config.branches) {
+    const rows = await getBranchRawRows(sheets, sheetTab);
+    metricsByBranch[sheetTab] = computeBranchDailyMetrics(rows, sheetTab, targetDate);
+  }
+  const stillEmpty = config.branches.map((b) => b.sheetTab).filter((tab) => metricsByBranch[tab].products.length === 0);
+
+  if (stillEmpty.length === 0) {
+    log(`Catchup [${RUN_LABEL}]: no gaps remain for ${isoDate(targetDate)} — nothing to do.`);
+    suppressSuccessNotification = true;
+    return;
+  }
+
+  log(`Catchup [${RUN_LABEL}]: gap present for ${stillEmpty.join(', ')} — re-checking and correcting whatever has landed.`);
+  const gmByBranch = loadGmSnapshot(targetDate) || {};
+  const { diagnostics } = await writeEverything(sheets, targetDate, gmByBranch);
+  const corrected = await correctMetricsValues(sheets, targetDate, diagnostics.metricsByBranch);
+
+  if (!corrected.length) {
+    log(`Catchup [${RUN_LABEL}]: still no new data for ${stillEmpty.join(', ')} — staying silent.`);
+    suppressSuccessNotification = true;
+    return;
+  }
+
+  const note = `metrics corrected via ${RUN_LABEL} catchup run — data now available for: ${corrected.join(', ')}`;
+  log(`⚠️ ${note}`);
+  const alertText = `⚠️ [${RUN_LABEL}] ${note} (${new Date().toISOString()})`;
+  queueAlert(alertText);
+  queueEmailAlert(alertText);
+}
+
 // Lets any cross-sheet lookups on the dashboard tabs below (e.g. the EAF
 // tab's K22 exact-date lookup into HOC-REPORTS-final's EAF Data Entry, a
 // SEPARATE spreadsheet — see hocReportsEntry.js) catch up before
@@ -536,6 +599,12 @@ async function run() {
   }
 
   const targetDate = eatCalendarDate(1);
+
+  if (isCatchupRun) {
+    await runCatchup(targetDate);
+    return;
+  }
+
   log(`Run started (${RUN_LABEL}). Target date = ${targetDate.toDateString()}`);
   logSessionAges();
 
@@ -551,10 +620,17 @@ run()
     // Every run posts exactly one Slack message when it completes cleanly —
     // if a gap/correction warning already fired above, this is a no-op (see
     // queueSuccessIfClean); otherwise it's the only signal in Slack that the
-    // run happened at all and found nothing to report.
-    const successText = `✅ [${RUN_LABEL}] Run completed successfully. (${new Date().toISOString()})`;
-    queueSuccessIfClean(successText);
-    queueEmailSuccessIfClean(successText);
+    // run happened at all and found nothing to report. Catchup runs
+    // (06:00/06:55) are the deliberate exception — see
+    // suppressSuccessNotification above runCatchup: they're designed to be
+    // invisible on an ordinary morning, so this line is skipped entirely
+    // rather than sending a green "completed successfully" ping for a run
+    // that intentionally did nothing.
+    if (!suppressSuccessNotification) {
+      const successText = `✅ [${RUN_LABEL}] Run completed successfully. (${new Date().toISOString()})`;
+      queueSuccessIfClean(successText);
+      queueEmailSuccessIfClean(successText);
+    }
     try {
       await flushAlerts();
     } catch (alertErr) {
