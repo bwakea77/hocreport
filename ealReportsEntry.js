@@ -20,6 +20,7 @@ const EAL_DATA_ENTRY_FORMATS = [
   { startCol: 0, endCol: 1, numberFormat: { type: 'DATE', pattern: 'dd/mm/yyyy' } }, // A Date
   { startCol: 2, endCol: 3, numberFormat: { type: 'NUMBER', pattern: '#,##0' } }, // C Revenue
   { startCol: 4, endCol: 6, numberFormat: { type: 'PERCENT', pattern: '0.0%' } }, // E/F GM %, EBITDA %
+  { startCol: 6, endCol: 8, numberFormat: { type: 'NUMBER', pattern: '#,##0' } }, // G/H Available Trucks, Booked
 ];
 const EAL_GM_EBITDA_FORMATS = [
   { startCol: 0, endCol: 1, numberFormat: { type: 'DATE', pattern: 'dd/mm/yyyy' } }, // A Date
@@ -35,14 +36,28 @@ const SEGMENT_LABELS = ['Transit', 'External', 'Other Income', 'Overall'];
 // Segment rows (Transit/External/Other Income) get Revenue (C) from the LCC
 // scrape's per-channel value, plus (as of 2026-08-15) their own single-day
 // Blended GM % (E) from the same per-channel drilldown that already feeds
-// EAL GM & EBITDA Entry's MTD version — Amount Collected (D), Available
-// Trucks (G), and Booked (H) still have no equivalent on the dashboard and
-// stay blank for manual entry.
+// EAL GM & EBITDA Entry's MTD version — Amount Collected (D) still has no
+// equivalent on the dashboard and stays blank for manual entry.
 function segmentRevenue(data) {
   return {
     Transit: data.channel.transit.value,
     External: data.channel.externalTransport.value,
     'Other Income': data.channel.other.value,
+  };
+}
+
+// Available Trucks (G) and Booked (H) — as of 2026-09-13, both filled with
+// the same figure: the count of trucks that carried revenue > 0 that day per
+// the LCC dashboard's per-truck breakdown (lccScraper.js's readTruckCount).
+// No equivalent exists for "Other Income" (not a trucking segment), and
+// readTruckCount itself returns null on a page-structure hiccup rather than
+// throwing (see its own comment) — collectCellUpdate already leaves a cell
+// untouched rather than blanking it on a null, so a truck-read failure never
+// wipes a real existing figure.
+function segmentTruckCount(data) {
+  return {
+    Transit: data.channel.transit.truckCount,
+    External: data.channel.externalTransport.truckCount,
   };
 }
 
@@ -78,6 +93,7 @@ function buildEalDataEntryRows(targetDate, data, existingKeys) {
 
   const revenueBySegment = segmentRevenue(data);
   const gmBySegment = segmentBlendedGm(data);
+  const truckCountBySegment = segmentTruckCount(data);
   for (const label of ['Transit', 'External', 'Other Income']) {
     if (existingKeys.has(`${dateSerial}|${label}`)) {
       log(`ealReportsEntry: EAL Data Entry already has a ${label} row for ${isoDate(targetDate)} — skipping.`);
@@ -90,6 +106,13 @@ function buildEalDataEntryRows(targetDate, data, existingKeys) {
     row[1] = label; // B Segment
     row[2] = revenue === null || revenue === undefined ? '' : revenue; // C Revenue
     row[4] = gm === null || gm === undefined ? '' : gm; // E Blended GM % (daily)
+    if (label !== 'Other Income') {
+      const trucks = truckCountBySegment[label];
+      if (trucks !== null && trucks !== undefined) {
+        row[6] = trucks; // G Available Trucks
+        row[7] = trucks; // H Booked
+      }
+    }
     rows.push(row);
     segmentsWritten.push(label);
   }
@@ -255,6 +278,7 @@ async function correctEalDataEntryValues(sheets, targetDate, dateData) {
   const dataEntryScan = await scanExistingRows(sheets, spreadsheetId, ealDataEntryTab, SEGMENT_LABELS);
   const revenueBySegment = segmentRevenue(dateData);
   const dailyGmBySegment = segmentBlendedGm(dateData);
+  const truckCountBySegment = segmentTruckCount(dateData);
   for (const label of ['Transit', 'External', 'Other Income']) {
     const row = dataEntryScan.rowsByKey.get(`${dateSerial}|${label}`);
     if (!row) continue;
@@ -264,6 +288,11 @@ async function correctEalDataEntryValues(sheets, targetDate, dateData) {
     // hold a real manual entry that a combined-range write would silently
     // blank out.
     collectCellUpdate(data, `'${ealDataEntryTab}'!E${row}`, dailyGmBySegment[label], `${label} Blended GM % for ${isoDate(targetDate)}`);
+    if (label !== 'Other Income') {
+      const trucks = truckCountBySegment[label];
+      collectCellUpdate(data, `'${ealDataEntryTab}'!G${row}`, trucks, `${label} Available Trucks for ${isoDate(targetDate)}`);
+      collectCellUpdate(data, `'${ealDataEntryTab}'!H${row}`, trucks, `${label} Booked for ${isoDate(targetDate)}`);
+    }
     corrected.push(label);
   }
   const overallDataEntryRow = dataEntryScan.rowsByKey.get(`${dateSerial}|Overall`);

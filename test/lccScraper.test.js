@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { readKpiAndChannel } = require('../lccScraper');
+const { readKpiAndChannel, countTrucksWithRevenue } = require('../lccScraper');
 
 const SAMPLE_BODY_LINES = [
   'REVENUE',
@@ -64,4 +64,28 @@ test('a missing KPI card only nulls that card, not the channel table', () => {
   const result = readKpiAndChannel(broken);
   assert.equal(result.revenue.actual, null);
   assert.equal(result.channel.externalTransport.value, 500000);
+});
+
+// Real drilldown innerText sample captured live 2026-09-13 (Transit,
+// 2026-09-12) — one truck with 0 revenue among four with real revenue.
+const TRUCK_DRILLDOWN_SAMPLE =
+  'TransitTZS 65,720,000\nGM%: 62.9%\n5 trucks active\n' +
+  'TRUCK\tREVENUE\tREVENUE SHARE\tGM%\tTRIPS\n' +
+  'T 560 EHU\t16,430,000\t\n25.0%\n\t71.1%\t1\n' +
+  'T 620 ELM\t16,430,000\t\n25.0%\n\t71.1%\t1\n' +
+  'T 466 EJP\t16,430,000\t\n25.0%\n\t70.2%\t1\n' +
+  'T 901 EGY\t16,430,000\t\n25.0%\n\t70.4%\t1\n' +
+  'T 621 EJU\t0\t\n0.0%\n\t0.0%\t1\n' +
+  "Click any row to drill into that truck's trips\n-55%";
+
+test('countTrucksWithRevenue counts only trucks with revenue > 0, out of the total active', () => {
+  const result = countTrucksWithRevenue(TRUCK_DRILLDOWN_SAMPLE);
+  assert.equal(result.withRevenue, 4);
+  assert.equal(result.total, 5);
+});
+
+test('countTrucksWithRevenue returns 0/0 when no truck rows are present', () => {
+  const result = countTrucksWithRevenue('External TransportTZS 0\nGM%: 0.0%\n0 trucks active\n');
+  assert.equal(result.withRevenue, 0);
+  assert.equal(result.total, 0);
 });

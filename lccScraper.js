@@ -143,6 +143,81 @@ async function readBlendedGm(browser, filter, channelLabel) {
   }
 }
 
+// Truck plate rows in a channel's "Trucks" drilldown render (innerText) as
+// e.g. "T 560 EHU\t16,430,000\t\n25.0%\n\t71.1%\t1" — TRUCK / REVENUE /
+// REVENUE SHARE / GM% / TRIPS, with REVENUE SHARE wrapping onto its own
+// line. Only the plate + the revenue figure immediately after it (before
+// that wrap) are needed here.
+const TRUCK_ROW_RE = /T \d{3} [A-Z]{3}\t([\d,]+)/g;
+
+function countTrucksWithRevenue(text) {
+  let withRevenue = 0;
+  let total = 0;
+  let m;
+  TRUCK_ROW_RE.lastIndex = 0;
+  while ((m = TRUCK_ROW_RE.exec(text))) {
+    total += 1;
+    if (parseFloat(m[1].replace(/,/g, '')) > 0) withRevenue += 1;
+  }
+  return { withRevenue, total };
+}
+
+// Drills into a channel's truck-level breakdown to count how many trucks
+// carried revenue > 0 that day — EAL Data Entry's "Available Trucks"/
+// "Booked" columns (config.js) had no automated source at all before this
+// (2026-09-13); both get this same count, since a truck that ran but posted
+// zero revenue isn't meaningfully "available"/"booked" for the day's report.
+// Same fresh-context-per-channel pattern as readBlendedGm and for the same
+// reason (this dashboard's back-navigation doesn't reliably restore
+// filter/period state after a drill-in), and the same
+// read-until-two-consecutive-reads-agree stabilization.
+//
+// Deliberately fault-isolated: unlike readBlendedGm (whose failure already
+// aborts/retries the whole scrape, a proven acceptable trade-off for a
+// figure this pipeline has written since August), this is a brand new page
+// interaction layered on top of an already-reliable revenue/GM/EBITDA
+// pipeline — a truck-count hiccup logs and returns null rather than taking
+// down everything else. A genuinely expired session is the one exception:
+// that still needs to surface and trigger the normal re-link/retry path,
+// not be swallowed as if it were a truck-read quirk.
+async function readTruckCount(browser, filter, channelLabel) {
+  const context = await browser.newContext({
+    viewport: { width: 1600, height: 1200 },
+    storageState: config.lcc.sessionStatePath,
+  });
+  try {
+    const page = await context.newPage();
+    await page.goto(config.lcc.url, { waitUntil: 'load', timeout: 30000 });
+    if (
+      (await waitForDashboardOrLogin(page, {
+        dashboardSelector: config.lcc.selectors.filtersButton,
+        loginSelector: config.lcc.selectors.loginPasswordInput,
+      })) === 'login'
+    ) {
+      throw new SessionExpiredError('LCC session expired — redirected to login page.');
+    }
+    await filter.apply(page);
+    await page.locator('text=' + channelLabel).first().click();
+
+    let previous = null;
+    for (let i = 0; i < 20; i++) {
+      await page.waitForTimeout(1000);
+      const text = await page.evaluate(() => document.body.innerText);
+      const { withRevenue, total } = countTrucksWithRevenue(text);
+      const key = `${withRevenue}/${total}`;
+      if (previous === key) return withRevenue;
+      previous = key;
+    }
+    throw new Error(`Truck count for "${channelLabel}" never stabilized.`);
+  } catch (err) {
+    if (err instanceof SessionExpiredError) throw err;
+    log(`LCC scraper: truck count for "${channelLabel}" unavailable — ${err.message}`);
+    return null;
+  } finally {
+    await context.close();
+  }
+}
+
 // "MTD"'s range end is always "today" — whatever day the scrape actually
 // runs — independent of targetDate (which for the morning runs is
 // yesterday), so it's confirmed generically (any "MTD\n<Mon D> – <Mon D>"
@@ -268,7 +343,7 @@ function customRangeFilter(startDate, endDate) {
   };
 }
 
-async function scrapeLccOnceWithFilter(filter, runLabel, evidenceDate) {
+async function scrapeLccOnceWithFilter(filter, runLabel, evidenceDate, { includeTruckCounts = false } = {}) {
   if (!fs.existsSync(config.lcc.sessionStatePath)) {
     throw new Error(`No persisted LCC session found at ${config.lcc.sessionStatePath}. Run scripts/captureLccSession.js first.`);
   }
@@ -311,19 +386,28 @@ async function scrapeLccOnceWithFilter(filter, runLabel, evidenceDate) {
       channel[key].blendedGm = await readBlendedGm(browser, filter, label);
     }
 
+    // Trucks only make sense for a single day, and only for Transit/External
+    // ("Other" has no truck concept) — see includeTruckCounts' callers below.
+    if (includeTruckCounts) {
+      for (const { label, key } of CHANNELS) {
+        if (key === 'other') continue;
+        channel[key].truckCount = await readTruckCount(browser, filter, label);
+      }
+    }
+
     return { revenue, grossMargin, ebitda, channel };
   } finally {
     await browser.close();
   }
 }
 
-async function scrapeLccWithRetry(filter, evidenceDate, runLabel) {
+async function scrapeLccWithRetry(filter, evidenceDate, runLabel, options) {
   const { attempts, delayMs } = config.lcc.retry;
   let lastErr;
   let relinked = false;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
-      return await scrapeLccOnceWithFilter(filter, runLabel, evidenceDate);
+      return await scrapeLccOnceWithFilter(filter, runLabel, evidenceDate, options);
     } catch (err) {
       if (err instanceof SessionExpiredError) {
         // Re-link once, in-run. This session expired overnight 2026-09-07→08
@@ -360,16 +444,27 @@ async function scrapeLccWithRetry(filter, evidenceDate, runLabel) {
 // with a fresh browser, same as scrapeGm; a genuinely expired session is
 // never retried since that needs scripts/captureLccSession.js, not another
 // attempt.
+//
+// Truck counts (readTruckCount) are only meaningful for a single calendar
+// day, so they're only requested for a non-MTD period — an "MTD truck count"
+// isn't a real, useful figure (EAL Data Entry's Available Trucks/Booked are
+// per-day columns), and skipping it there saves two extra page drill-ins on
+// every MTD read.
 async function scrapeLcc(period, targetDate, runLabel) {
-  return scrapeLccWithRetry(periodFilter(period, targetDate), targetDate, runLabel);
+  return scrapeLccWithRetry(periodFilter(period, targetDate), targetDate, runLabel, {
+    includeTruckCounts: period !== 'MTD',
+  });
 }
 
 // Scrapes the EAL Dashboard for an explicit start/end date range via the
 // "Custom Date" filter — used for backfilling a specific past day (or range)
 // that isn't reachable via the Yesterday/Today/MTD relative buttons. Pass
-// the same date for start and end to read a single day.
+// the same date for start and end to read a single day. Same MTD-vs-daily
+// reasoning as scrapeLcc above for whether truck counts are worth reading.
 async function scrapeLccCustomRange(startDate, endDate, runLabel) {
-  return scrapeLccWithRetry(customRangeFilter(startDate, endDate), endDate, runLabel);
+  return scrapeLccWithRetry(customRangeFilter(startDate, endDate), endDate, runLabel, {
+    includeTruckCounts: isoDateCompact(startDate) === isoDateCompact(endDate),
+  });
 }
 
 // Lists which fields of a scraped LCC channel table (see readKpiAndChannel)
@@ -392,4 +487,4 @@ function findLccGaps(data) {
   return gaps;
 }
 
-module.exports = { scrapeLcc, scrapeLccCustomRange, findLccGaps, readKpiAndChannel };
+module.exports = { scrapeLcc, scrapeLccCustomRange, findLccGaps, readKpiAndChannel, countTrucksWithRevenue };
