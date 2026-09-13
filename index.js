@@ -8,7 +8,7 @@ const { scrapeLcc, findLccGaps } = require('./lccScraper');
 const { getSheetsClient } = require('./sheetsClient');
 const { runDailySnapshot } = require('./dailySnapshot');
 const { writeLccYesterdaySnapshot, writeLccTodaySnapshot } = require('./lccSnapshot');
-const { runHocReportsEntry, correctGmValues } = require('./hocReportsEntry');
+const { runHocReportsEntry, correctGmValues, correctMetricsValues } = require('./hocReportsEntry');
 const { runEalReportsEntry, correctEalValues, correctEalDataEntryValues, appendEalDataEntryRows } = require('./ealReportsEntry');
 const { saveGmSnapshot, loadGmSnapshot, compareGm } = require('./gmSnapshotStore');
 const { saveLccSnapshot, loadLccSnapshot, compareLcc } = require('./lccSnapshotStore');
@@ -292,10 +292,29 @@ async function writeAndCorrectGm(sheets, targetDate, gmByBranch, correctionNote)
   // correctGmValues retries its own write internally (see manualEntryRows'
   // collectCellUpdate/applyBatchUpdate usage there) — not wrapped again here.
   await correctGmValues(sheets, targetDate, gmByBranch);
+  await correctMetricsValues(sheets, targetDate, diagnostics.metricsByBranch);
   log(`⚠️ ${correctionNote}`);
   const alertText = `⚠️ [0530] ${correctionNote} (${new Date().toISOString()})`;
   queueAlert(alertText);
   queueEmailAlert(alertText);
+  await alertOnGaps(diagnostics, hocReportsResult);
+}
+
+// Runs when GM was stable between 05:00 and 05:30 (writeAndCorrectGm above
+// never ran, so writeEverything hasn't happened yet this run). Re-checks
+// each branch's raw metrics independently of GM's stability — see
+// correctMetricsValues for why a branch's data can land late regardless of
+// what the GM scrape found.
+async function verifyMetricsOnly(sheets, targetDate, gmByBranch) {
+  const { diagnostics, hocReportsResult } = await writeEverything(sheets, targetDate, gmByBranch);
+  const corrected = await correctMetricsValues(sheets, targetDate, diagnostics.metricsByBranch);
+  if (corrected.length) {
+    const note = `metrics corrected vs 05:00 run — data now available for: ${corrected.join(', ')}`;
+    log(`⚠️ [0530] ${note}`);
+    const alertText = `⚠️ [0530] ${note} (${new Date().toISOString()})`;
+    queueAlert(alertText);
+    queueEmailAlert(alertText);
+  }
   await alertOnGaps(diagnostics, hocReportsResult);
 }
 
@@ -339,6 +358,7 @@ async function runVerify(targetDate) {
       await writeAndCorrectGm(sheets, targetDate, gmByBranch, `GM corrected vs 05:00 run — ${diffs.join('; ')}`);
     } else {
       log('GM stable between 05:00 and 05:30 runs — nothing to correct.');
+      await verifyMetricsOnly(sheets, targetDate, gmByBranch);
     }
   }
 
@@ -357,7 +377,19 @@ async function runVerify(targetDate) {
 // been run against these dashboard tabs long enough to confirm that always
 // lands in time — if a posted image looks stale, this is the first thing to
 // widen.
-const SHEET_IMAGE_SETTLE_DELAY_MS = 5000;
+//
+// Widened 5000 -> 15000 on 2026-09-13: confirmed live that 5s wasn't always
+// enough even for the plain same-spreadsheet case README.md's sheetImage.js
+// notes call out separately (EAF/EAL-MORN/EAL-EOD, no IMPORTRANGE involved)
+// — the 05:30 run's emailed EAL-MORN image showed Transit's "Yesterday's
+// Performance" as 0/"Needs Attention" while a live values.get() on the same
+// cell, and the underlying EAL Data Entry row, already read the correct
+// 65,720,000/"On Track" well before that run. sheetImage.js's export
+// endpoint (an unofficial per-range PDF render, not a live browser view) can
+// apparently still serve a render that hasn't caught up to a recent write,
+// even for a formula Sheets itself recalculates immediately — so the settle
+// window needs to cover that render lag too, not just IMPORTRANGE's.
+const SHEET_IMAGE_SETTLE_DELAY_MS = 15000;
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

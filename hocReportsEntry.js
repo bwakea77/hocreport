@@ -340,4 +340,84 @@ async function correctGmValues(sheets, targetDate, gmByBranch) {
   return corrected;
 }
 
-module.exports = { runHocReportsEntry, correctGmValues };
+// Overwrites the revenue/ASP/returns/discount/loadout cells of each
+// already-existing EAF Data Entry row for targetDate with freshly recomputed
+// metrics — mirrors correctGmValues, but for the raw branch metrics instead
+// of GM%. Unlike GM (an expensive Playwright re-scrape), each branch's raw
+// rows live in a plain Sheets tab populated via IMPORTRANGE from that
+// branch's own source spreadsheet (automation_build_spec.md) — an import
+// this pipeline doesn't control the timing of, and the documented cause of
+// "N raw rows fetched, 0 product line(s) for target date" (see
+// dailySnapshot.js's zeroProductBranches / index.js's alertOnGaps). A branch
+// whose import hadn't landed by 05:00 previously got no second chance once
+// GM happened to be stable between the 05:00/05:30 runs, since nothing else
+// re-checked it (confirmed 2026-09-11 and 2026-09-13: KINYEREZI/DODOMA both
+// showed up correctly in the sheet within the hour, but nothing in this
+// pipeline ever went back to look). Re-fetching here is a plain values.get,
+// not a browser run, so there's no cost to attempting it every verify run
+// regardless of whether GM moved.
+//
+// A branch still showing zero product lines on this re-check is left alone
+// (skipped) rather than written as zero — not a safety guard so much as a
+// no-op, since the existing row already holds zero from the 05:00 insert.
+//
+// OVERALL is skipped: its revenue is a SUM() formula over the 4 branch rows
+// in the EAF tab, not a value this pipeline writes directly (see
+// buildDataEntryRows above). DODOMA writes its Banana/Potato breakdown
+// columns (J/K/L/M, R/S/T, V/W/X); C/H/I there are formulas referencing
+// those cells and recompute automatically once the breakdown is corrected.
+async function correctMetricsValues(sheets, targetDate, metricsByBranch) {
+  const { spreadsheetId, dataEntryTab } = config.hocReports;
+  const dateSerial = dateToSerial(targetDate);
+  const knownLabels = DATA_ENTRY_ROW_ORDER.map(dataEntryLabelFor);
+  const corrected = [];
+  const data = [];
+
+  const dataEntryScan = await scanExistingRows(sheets, spreadsheetId, dataEntryTab, knownLabels);
+
+  for (const sheetTab of DATA_ENTRY_BRANCH_ORDER) {
+    const metrics = metricsByBranch[sheetTab];
+    if (!metrics || metrics.total.rowCount === 0) continue;
+
+    const label = dataEntryLabelFor(sheetTab);
+    const row = dataEntryScan.rowsByKey.get(`${dateSerial}|${label}`);
+    if (!row) continue;
+
+    let touched = false;
+    const touch = (range, value, description) => {
+      if (collectCellUpdate(data, range, value, description)) touched = true;
+    };
+
+    if (sheetTab === 'DODOMA') {
+      const banana = sumDodomaProduct(metrics.products, 'Banana');
+      const potato = sumDodomaProduct(metrics.products, 'Potato');
+      touch(`'${dataEntryTab}'!J${row}`, banana.revenue, `${label} Banana revenue for ${isoDate(targetDate)}`);
+      touch(`'${dataEntryTab}'!K${row}`, banana.loadout, `${label} Banana loadout for ${isoDate(targetDate)}`);
+      touch(`'${dataEntryTab}'!L${row}`, potato.revenue, `${label} Potato revenue for ${isoDate(targetDate)}`);
+      touch(`'${dataEntryTab}'!M${row}`, potato.loadout, `${label} Potato loadout for ${isoDate(targetDate)}`);
+      touch(`'${dataEntryTab}'!R${row}`, banana.asp, `${label} Banana ASP for ${isoDate(targetDate)}`);
+      touch(`'${dataEntryTab}'!S${row}`, banana.returns, `${label} Banana returns for ${isoDate(targetDate)}`);
+      touch(`'${dataEntryTab}'!T${row}`, banana.discount ? -banana.discount : 0, `${label} Banana discount for ${isoDate(targetDate)}`);
+      touch(`'${dataEntryTab}'!V${row}`, potato.asp, `${label} Potato ASP for ${isoDate(targetDate)}`);
+      touch(`'${dataEntryTab}'!W${row}`, potato.returns, `${label} Potato returns for ${isoDate(targetDate)}`);
+      touch(`'${dataEntryTab}'!X${row}`, potato.discount ? -potato.discount : 0, `${label} Potato discount for ${isoDate(targetDate)}`);
+    } else {
+      const total = metrics.total;
+      touch(`'${dataEntryTab}'!C${row}`, total.totalRevenue, `${label} revenue for ${isoDate(targetDate)}`);
+      touch(`'${dataEntryTab}'!F${row}`, total.avgSellingPrice, `${label} ASP for ${isoDate(targetDate)}`);
+      touch(`'${dataEntryTab}'!G${row}`, total.totalReturns, `${label} returns for ${isoDate(targetDate)}`);
+      touch(`'${dataEntryTab}'!H${row}`, total.totalDiscount ? -total.totalDiscount : 0, `${label} discount for ${isoDate(targetDate)}`);
+      touch(`'${dataEntryTab}'!I${row}`, total.totalLoadout, `${label} loadout for ${isoDate(targetDate)}`);
+    }
+    if (touched) corrected.push(label);
+  }
+
+  await withRetryOnce('hocReportsEntry: metrics correction write', () => applyBatchUpdate(sheets, spreadsheetId, data));
+
+  if (corrected.length) {
+    log(`hocReportsEntry: corrected metrics for existing rows — EAF Data Entry: ${corrected.join(', ')}.`);
+  }
+  return corrected;
+}
+
+module.exports = { runHocReportsEntry, correctGmValues, correctMetricsValues };
