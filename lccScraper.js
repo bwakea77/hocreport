@@ -65,16 +65,32 @@ function matchChannelValue(bodyText, label) {
 // value — LCC_SNAPSHOT only ever shows a flat Channel/Value/Blended GM/EBITDA
 // table, so achievement %, target, delta, and share (all present on the page
 // but not in that table) are never parsed here.
+//
+// Site redesign (first seen in cron.log 2026-10-31 16:25): the KPI cards
+// went from "REVENUE / 191.1% / ▲ / A: / TZS 83,433,000 / T: ..." to
+// "REVENUE / 17.7% / ▼ / Actual / TZS 8.0M / Target / TZS 45.1M" — the
+// "A:" label became "Actual", and the revenue card now shows a rounded
+// abbreviation (8.0M) instead of the exact figure. The exact revenue is
+// still on the page as the Revenue by Channel header total
+// ("Revenue breakdown by stream / TZS 7,990,000"), confirmed live
+// 2026-11-09 to equal the sum of the channel rows, so revenue is read from
+// there. Both card layouts are accepted, and the trend arrow is optional.
+function kpiPercentRe(title) {
+  return new RegExp(`${title}\\n[\\d.-]+%\\n(?:[▲▼]\\n)?(?:A:|Actual)\\n([\\d.-]+)%\\n`);
+}
+
 function readKpiAndChannel(bodyText) {
-  const revenueMatch = bodyText.match(/REVENUE\n[\d.]+%\n[▲▼]\nA:\nTZS ([\d,]+)\n/);
+  const channelTotalMatch = bodyText.match(/Revenue breakdown by stream\n+TZS ([\d,]+)\n/);
+  const oldCardMatch = bodyText.match(/REVENUE\n[\d.-]+%\n(?:[▲▼]\n)?A:\nTZS ([\d,]+)\n/);
+  const revenueMatch = channelTotalMatch || oldCardMatch;
   const revenue = { actual: revenueMatch ? parseNumber(revenueMatch[1]) : null };
   if (!revenueMatch) log('LCC scraper: could not parse REVENUE KPI card.');
 
-  const gmMatch = bodyText.match(/GROSS MARGIN\n[\d.-]+%\n[▲▼]\nA:\n([\d.-]+)%\n/);
+  const gmMatch = bodyText.match(kpiPercentRe('GROSS MARGIN'));
   const grossMargin = { actual: gmMatch ? `${gmMatch[1]}%` : null };
   if (!gmMatch) log('LCC scraper: could not parse GROSS MARGIN KPI card.');
 
-  const ebitdaMatch = bodyText.match(/EBITDA\n[\d.-]+%\n[▲▼]\nA:\n([\d.-]+)%\n/);
+  const ebitdaMatch = bodyText.match(kpiPercentRe('EBITDA'));
   const ebitda = { actual: ebitdaMatch ? `${ebitdaMatch[1]}%` : null };
   if (!ebitdaMatch) log('LCC scraper: could not parse EBITDA KPI card.');
 
@@ -199,11 +215,22 @@ async function readTruckCount(browser, filter, channelLabel) {
     await filter.apply(page);
     await page.locator('text=' + channelLabel).first().click();
 
+    // Two agreeing reads alone aren't enough: before the truck table renders,
+    // two consecutive reads both see "0/0" and agree, and the drill-down
+    // used to return 0 for a channel that really ran trucks (EAL Data Entry
+    // showed 0/0 trucks for 2026-10-31 Transit at 61M revenue). The panel
+    // states its own row count ("6 trucks active", confirmed live
+    // 2026-11-09), so a read only counts once the parsed rows match it.
     let previous = null;
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < 30; i++) {
       await page.waitForTimeout(1000);
       const text = await page.evaluate(() => document.body.innerText);
+      const active = text.match(/(\d+) trucks? active/);
       const { withRevenue, total } = countTrucksWithRevenue(text);
+      if (!active || Number(active[1]) !== total) {
+        previous = null;
+        continue;
+      }
       const key = `${withRevenue}/${total}`;
       if (previous === key) return withRevenue;
       previous = key;
@@ -276,18 +303,41 @@ function isoDateCompact(date) {
 // this only supports dates within those two visible months and throws
 // rather than guessing at unverified controls for anything further out —
 // used for one-off/backfill custom-range reads, not the daily automation.
-async function lccCalendarMonthPanel(page, date) {
-  const label = `${MONTH_NAMES[date.getMonth()]} ${date.getFullYear()}`;
-  const panel = page
+//
+// Since the 2026-10-31 redesign the picker shows a single month, flanked by
+// chevron buttons (lucide-chevron-right; the "previous" one is the same icon
+// with rotate-180), confirmed live 2026-11-09. When the wanted month isn't
+// showing, this steps toward it with those chevrons, up to 12 times.
+const LCC_MONTH_CAPTION_RE = new RegExp(`^(${MONTH_NAMES.join('|')}) (\\d{4})$`);
+
+function lccPanelLocator(page, label) {
+  return page
     .locator('p', { hasText: new RegExp(`^${label}$`) })
     .locator('xpath=ancestor::div[contains(@class,"min-w-")]')
     .first();
-  if (!(await panel.count())) {
-    throw new Error(
-      `LCC custom-date calendar doesn't show "${label}" in either visible month panel (only the current and next month are shown; further navigation isn't implemented).`
-    );
+}
+
+async function lccCalendarMonthPanel(page, date) {
+  const label = `${MONTH_NAMES[date.getMonth()]} ${date.getFullYear()}`;
+  const wanted = date.getFullYear() * 12 + date.getMonth();
+  for (let step = 0; step <= 12; step++) {
+    const panel = lccPanelLocator(page, label);
+    if (await panel.count()) return panel;
+    const captions = await page.locator('p').allInnerTexts();
+    const shown = captions.map((t) => t.trim().match(LCC_MONTH_CAPTION_RE)).find(Boolean);
+    if (!shown) break;
+    const shownIdx = Number(shown[2]) * 12 + MONTH_NAMES.indexOf(shown[1]);
+    const chevron = wanted < shownIdx
+      ? 'button:has(svg.lucide-chevron-right.rotate-180)'
+      : 'button:has(svg.lucide-chevron-right:not(.rotate-180))';
+    const calendar = page
+      .locator('p', { hasText: LCC_MONTH_CAPTION_RE })
+      .first()
+      .locator('xpath=ancestor::div[.//button][1]');
+    await calendar.locator(chevron).first().click();
+    await page.waitForTimeout(400);
   }
-  return panel;
+  throw new Error(`LCC custom-date calendar couldn't navigate to "${label}".`);
 }
 
 async function clickLccCalendarDay(page, date) {

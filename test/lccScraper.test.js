@@ -89,3 +89,27 @@ test('countTrucksWithRevenue returns 0/0 when no truck rows are present', () => 
   assert.equal(result.withRevenue, 0);
   assert.equal(result.total, 0);
 });
+
+// Layout live since 2026-10-31 (text captured from the dashboard 2026-11-09):
+// "Actual" replaces "A:", and the revenue card is rounded ("TZS 15.7M"), so
+// revenue must come from the exact Revenue by Channel total instead.
+const REDESIGN_BODY = [
+  'REVENUE', '34.8%', '▼', 'Actual', 'TZS 15.7M', 'Target', 'TZS 45.1M',
+  'GROSS MARGIN', '29.3%', '▼', 'Actual', '29.3%', 'Target', '35.0%',
+  'EBITDA', '-71.7%', '▼', 'Actual', '-71.7%', 'Target', '10.0%',
+  'Revenue by Channel', '', 'Revenue breakdown by stream', '', 'TZS 15,712,271', 'vs prior period',
+  'External Transport', '9,776,271', '↑0.0%', 'GM 27.0%',
+  'Transit', '5,936,000', '↓81.6%', 'GM 33.3%',
+  'Other', '0', '↑0.0%',
+  'Revenue by Zone',
+].join('\n');
+
+test('readKpiAndChannel parses the 2026-10-31 redesign with exact (unrounded) revenue', () => {
+  const r = readKpiAndChannel(REDESIGN_BODY);
+  assert.equal(r.revenue.actual, 15712271);
+  assert.equal(r.grossMargin.actual, '29.3%');
+  assert.equal(r.ebitda.actual, '-71.7%');
+  assert.equal(r.channel.externalTransport.value, 9776271);
+  assert.equal(r.channel.transit.value, 5936000);
+  assert.equal(r.channel.other.value, 0);
+});
