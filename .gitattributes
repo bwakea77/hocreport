@@ -1,0 +1,4 @@
+# Windows files keep Windows line endings in a checkout.
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+SETUP-WINDOWS.txt text eol=crlf

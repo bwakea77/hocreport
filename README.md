@@ -238,6 +238,17 @@ The `--verify` run re-scrapes GM and compares it against the primary run's
 snapshot (`gm-snapshot.json`) — see "Notes" below for what happens on a
 mismatch.
 
+### Filling in missed days
+
+```
+node backfillRange.js --from 2026-11-10 --to 2026-11-12 --dry   # scrape and print only
+node backfillRange.js --from 2026-11-10 --to 2026-11-12         # write
+```
+
+Does what each date's 05:30 verify run would have done: inserts missing EAF
+and EAL entry rows and corrects existing ones, from Custom Date range reads
+that must agree twice. See the header of `backfillRange.js`.
+
 ## Cron
 
 Add to `crontab -e` (adjust the path):
@@ -247,6 +258,9 @@ Add to `crontab -e` (adjust the path):
 30 5 * * * cd /path/to/this/project && /usr/bin/node index.js --verify >> /path/to/this/project/cron.log 2>&1
 25 16 * * * cd /path/to/this/project && /usr/bin/node index.js --eod >> /path/to/this/project/cron.log 2>&1
 ```
+
+On Windows, use Task Scheduler instead: `Setup.cmd` registers all five runs
+(see `SETUP-WINDOWS.txt`), and `Backfill.cmd` wraps `backfillRange.js`.
 
 05:00 is right at the point the dashboard is expected to finalize the prior
 day's "Today" figure (§4.1 of the spec); 05:30 exists specifically to catch

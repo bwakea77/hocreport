@@ -1,0 +1,103 @@
+hocreport on Windows
+====================
+
+This folder runs the daily HOC/EAL reports from a Windows PC, at the same
+times as before (East Africa Time):
+
+  05:00  report         05:30  verify
+  06:00  catch-up       06:55  catch-up       16:25  end of day
+
+IMPORTANT: this folder contains the dashboard passwords, the SMTP password,
+the Slack token and the Google key (.env and service-account.json). Copy it
+by USB or another private route. Don't email it or put it in a shared drive.
+
+
+1. Put the folder in place
+--------------------------
+Unzip so that you have C:\hocreport\Setup.cmd. A short path avoids Windows
+path-length problems. Avoid OneDrive-synced folders such as Documents and
+Desktop.
+
+The PC's time zone must be (UTC+03:00) Nairobi
+(Settings > Time & language > Date & time). Setup checks this.
+
+
+2. Run setup
+------------
+Double-click C:\hocreport\Setup.cmd.
+
+- It needs internet and downloads about 250 MB (Node.js, Poppler, Chromium).
+- If Windows shows "Windows protected your PC", click More info > Run anyway.
+- Near the end, Windows asks for admin rights to create the scheduled tasks.
+  Click Yes.
+
+Setup can be run again at any time. It keeps what it already downloaded and
+replaces the tasks.
+
+
+3. Keep the PC awake at the run times
+-------------------------------------
+The tasks run whether or not you are signed in, but the PC has to be on.
+
+- Best: keep it plugged in and set
+  Settings > System > Power > Screen and sleep > "When plugged in, put my
+  device to sleep after" = Never.
+  On a laptop, also set Control Panel > Power Options > "Choose what closing
+  the lid does" > When plugged in = Do nothing.
+- If you let it sleep, the tasks try to wake it. This only works when
+  Power Options > Change plan settings > Change advanced power settings >
+  Sleep > Allow wake timers is set to Enable.
+- If the PC was off at a run time, that run starts as soon as the PC is back
+  on, so the report arrives late rather than not at all.
+
+It also needs internet at the run times. A failed run sends its usual
+failure alert to Slack and email.
+
+
+4. Test it
+----------
+Open Task Scheduler (Start > type "Task Scheduler"). Under Task Scheduler
+Library, open the hocreport folder, right-click "0500 report" and choose Run.
+
+This is a real run. It writes yesterday's figures to the Sheet and posts to
+Slack and email. After a minute or two, open C:\hocreport\cron.log and check
+that it ends with "Run completed".
+
+
+Turning it off
+--------------
+Only one machine may run hocreport at a time, or every report goes out
+twice. Before starting it anywhere else (for example on a VPS), open Task
+Scheduler > hocreport and right-click each task > Disable.
+
+To remove it completely, delete the five tasks and the hocreport folder in
+Task Scheduler, then delete C:\hocreport.
+
+
+Filling in missed days
+----------------------
+Double-click C:\hocreport\Backfill.cmd and type the first and last missed
+day (YYYY-MM-DD). For a single day, press Enter at "Last missed day".
+
+1. It first does a dry run: it reads both dashboards for each day and shows
+   the figures, but writes nothing.
+2. It then asks "Write these figures to the Sheets [Y,N]?". Y writes them.
+
+For each day it adds the rows that are missing from the EAF and EAL entry
+tabs, and corrects rows that are there but incomplete. Each figure has to
+come back the same from two separate reads, so expect a few minutes per day.
+Rows already there are never duplicated. They do get the dashboards' current
+figures, though, so give it only the days that were missed.
+
+Today can't be backfilled; the daily runs handle yesterday and today. If a
+day shows FAILED (the two reads never agreed, or the dashboard had gaps),
+the other days are still written. Run Backfill.cmd again for that day later.
+
+
+Files
+-----
+cron.log, run.log   logs of every run
+evidence\           dashboard screenshots
+sheet-images\       the report images that were sent
+tools\              Node.js, Poppler and Chromium (made by setup)
+windows\            setup and the script the tasks and Backfill.cmd run
